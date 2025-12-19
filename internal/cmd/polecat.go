@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
@@ -149,6 +150,30 @@ Example:
 	RunE: runPolecatReset,
 }
 
+var polecatSyncCmd = &cobra.Command{
+	Use:   "sync <rig>/<polecat>",
+	Short: "Sync beads for a polecat",
+	Long: `Sync beads for a polecat's worktree.
+
+Runs 'bd sync' in the polecat's worktree to push local beads changes
+to the shared sync branch and pull remote changes.
+
+Use --all to sync all polecats in a rig.
+Use --from-main to only pull (no push).
+
+Examples:
+  gt polecat sync gastown/Toast
+  gt polecat sync gastown --all
+  gt polecat sync gastown/Toast --from-main`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runPolecatSync,
+}
+
+var (
+	polecatSyncAll      bool
+	polecatSyncFromMain bool
+)
+
 func init() {
 	// List flags
 	polecatListCmd.Flags().BoolVar(&polecatListJSON, "json", false, "Output as JSON")
@@ -156,6 +181,10 @@ func init() {
 
 	// Remove flags
 	polecatRemoveCmd.Flags().BoolVarP(&polecatForce, "force", "f", false, "Force removal, bypassing checks")
+
+	// Sync flags
+	polecatSyncCmd.Flags().BoolVar(&polecatSyncAll, "all", false, "Sync all polecats in the rig")
+	polecatSyncCmd.Flags().BoolVar(&polecatSyncFromMain, "from-main", false, "Pull only, no push")
 
 	// Add subcommands
 	polecatCmd.AddCommand(polecatListCmd)
@@ -165,6 +194,7 @@ func init() {
 	polecatCmd.AddCommand(polecatSleepCmd)
 	polecatCmd.AddCommand(polecatDoneCmd)
 	polecatCmd.AddCommand(polecatResetCmd)
+	polecatCmd.AddCommand(polecatSyncCmd)
 
 	rootCmd.AddCommand(polecatCmd)
 }
@@ -465,5 +495,85 @@ func runPolecatReset(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("%s Polecat %s has been reset to idle.\n", style.SuccessPrefix, polecatName)
+	return nil
+}
+
+func runPolecatSync(cmd *cobra.Command, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("rig or rig/polecat address required")
+	}
+
+	// Parse address - could be "rig" or "rig/polecat"
+	rigName, polecatName, err := parseAddress(args[0])
+	if err != nil {
+		// Might just be a rig name
+		rigName = args[0]
+		polecatName = ""
+	}
+
+	mgr, r, err := getPolecatManager(rigName)
+	if err != nil {
+		return err
+	}
+
+	// Get list of polecats to sync
+	var polecatsToSync []string
+	if polecatSyncAll || polecatName == "" {
+		polecats, err := mgr.List()
+		if err != nil {
+			return fmt.Errorf("listing polecats: %w", err)
+		}
+		for _, p := range polecats {
+			polecatsToSync = append(polecatsToSync, p.Name)
+		}
+	} else {
+		polecatsToSync = []string{polecatName}
+	}
+
+	if len(polecatsToSync) == 0 {
+		fmt.Println("No polecats to sync.")
+		return nil
+	}
+
+	// Sync each polecat
+	var syncErrors []string
+	for _, name := range polecatsToSync {
+		polecatDir := filepath.Join(r.Path, "polecats", name)
+
+		// Check directory exists
+		if _, err := os.Stat(polecatDir); os.IsNotExist(err) {
+			syncErrors = append(syncErrors, fmt.Sprintf("%s: directory not found", name))
+			continue
+		}
+
+		// Build sync command
+		syncArgs := []string{"sync"}
+		if polecatSyncFromMain {
+			syncArgs = append(syncArgs, "--from-main")
+		}
+
+		fmt.Printf("Syncing %s/%s...\n", rigName, name)
+
+		syncCmd := exec.Command("bd", syncArgs...)
+		syncCmd.Dir = polecatDir
+		output, err := syncCmd.CombinedOutput()
+		if err != nil {
+			syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", name, err))
+			if len(output) > 0 {
+				fmt.Printf("  %s\n", style.Dim.Render(string(output)))
+			}
+		} else {
+			fmt.Printf("  %s\n", style.Success.Render("✓ synced"))
+		}
+	}
+
+	if len(syncErrors) > 0 {
+		fmt.Printf("\n%s Some syncs failed:\n", style.Warning.Render("Warning:"))
+		for _, e := range syncErrors {
+			fmt.Printf("  - %s\n", e)
+		}
+		return fmt.Errorf("%d sync(s) failed", len(syncErrors))
+	}
+
 	return nil
 }

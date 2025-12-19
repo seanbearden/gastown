@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -123,6 +124,14 @@ func (m *Manager) Start(polecat string, opts StartOptions) error {
 	_ = m.tmux.SetEnvironment(sessionID, "GT_RIG", m.rig.Name)
 	_ = m.tmux.SetEnvironment(sessionID, "GT_POLECAT", polecat)
 
+	// CRITICAL: Set beads environment for worktree polecats
+	// Polecats share the rig's beads directory (in mayor/rig/.beads)
+	// BEADS_NO_DAEMON=1 prevents daemon from committing to wrong branch
+	beadsDir := filepath.Join(m.rig.Path, "mayor", "rig", ".beads")
+	_ = m.tmux.SetEnvironment(sessionID, "BEADS_DIR", beadsDir)
+	_ = m.tmux.SetEnvironment(sessionID, "BEADS_NO_DAEMON", "1")
+	_ = m.tmux.SetEnvironment(sessionID, "BEADS_AGENT_NAME", fmt.Sprintf("%s/%s", m.rig.Name, polecat))
+
 	// Send initial command
 	command := opts.Command
 	if command == "" {
@@ -157,6 +166,16 @@ func (m *Manager) Stop(polecat string, force bool) error {
 		return ErrSessionNotFound
 	}
 
+	// Sync beads before shutdown to preserve any changes
+	// Run in the polecat's worktree directory
+	if !force {
+		polecatDir := m.polecatDir(polecat)
+		if err := m.syncBeads(polecatDir); err != nil {
+			// Non-fatal - log and continue with shutdown
+			fmt.Printf("Warning: beads sync failed: %v\n", err)
+		}
+	}
+
 	// Try graceful shutdown first (unless forced)
 	if !force {
 		_ = m.tmux.SendKeysRaw(sessionID, "C-c") // Ctrl+C
@@ -169,6 +188,13 @@ func (m *Manager) Stop(polecat string, force bool) error {
 	}
 
 	return nil
+}
+
+// syncBeads runs bd sync in the given directory.
+func (m *Manager) syncBeads(workDir string) error {
+	cmd := exec.Command("bd", "sync")
+	cmd.Dir = workDir
+	return cmd.Run()
 }
 
 // IsRunning checks if a polecat session is active.

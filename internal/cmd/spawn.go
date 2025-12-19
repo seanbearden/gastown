@@ -187,6 +187,12 @@ func runSpawn(cmd *cobra.Command, args []string) error {
 	// Beads operations use mayor/rig directory (rig-level beads)
 	beadsPath := filepath.Join(r.Path, "mayor", "rig")
 
+	// Sync beads to ensure fresh state before spawn operations
+	if err := syncBeads(beadsPath, true); err != nil {
+		// Non-fatal - continue with possibly stale beads
+		fmt.Printf("%s beads sync: %v\n", style.Dim.Render("Warning:"), err)
+	}
+
 	// Handle molecule instantiation if specified
 	if spawnMolecule != "" {
 		b := beads.New(beadsPath)
@@ -271,6 +277,12 @@ func runSpawn(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Assigned %s to %s/%s\n",
 		style.Bold.Render("✓"),
 		assignmentID, rigName, polecatName)
+
+	// Sync beads to push assignment changes
+	if err := syncBeads(beadsPath, false); err != nil {
+		// Non-fatal warning
+		fmt.Printf("%s beads push: %v\n", style.Dim.Render("Warning:"), err)
+	}
 
 	// Stop here if --no-start
 	if spawnNoStart {
@@ -461,6 +473,18 @@ func createBeadsTask(rigPath, message string) (*BeadsIssue, error) {
 	return &issue, nil
 }
 
+// syncBeads runs bd sync in the given directory.
+// This ensures beads state is fresh before spawn operations.
+func syncBeads(workDir string, fromMain bool) error {
+	args := []string{"sync"}
+	if fromMain {
+		args = append(args, "--from-main")
+	}
+	cmd := exec.Command("bd", args...)
+	cmd.Dir = workDir
+	return cmd.Run()
+}
+
 // buildSpawnContext creates the initial context message for the polecat.
 func buildSpawnContext(issue *BeadsIssue, message string) string {
 	var sb strings.Builder
@@ -479,7 +503,14 @@ func buildSpawnContext(issue *BeadsIssue, message string) string {
 		sb.WriteString(fmt.Sprintf("Task: %s\n", message))
 	}
 
-	sb.WriteString("\nWork on this task. When complete, commit your changes and signal DONE.\n")
+	sb.WriteString("\n## Workflow\n")
+	sb.WriteString("1. Run `gt prime` to load polecat context\n")
+	sb.WriteString("2. Run `bd sync --from-main` to get fresh beads\n")
+	sb.WriteString("3. Work on your task, commit changes\n")
+	sb.WriteString("4. Run `bd close <issue-id>` when done\n")
+	sb.WriteString("5. Run `bd sync` to push beads changes\n")
+	sb.WriteString("6. Push code: `git push origin HEAD`\n")
+	sb.WriteString("7. Signal DONE with summary\n")
 
 	return sb.String()
 }
