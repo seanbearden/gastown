@@ -245,6 +245,42 @@ func (m *Manager) Sleep(name string) error {
 	return m.SetState(name, StateIdle)
 }
 
+// Finish transitions a polecat from working/done/stuck to idle and clears the issue.
+func (m *Manager) Finish(name string) error {
+	polecat, err := m.Get(name)
+	if err != nil {
+		return err
+	}
+
+	// Only allow finishing from working-related states
+	switch polecat.State {
+	case StateWorking, StateDone, StateStuck:
+		// OK to finish
+	default:
+		return fmt.Errorf("polecat is not in a finishing state (state: %s)", polecat.State)
+	}
+
+	polecat.Issue = ""
+	polecat.State = StateIdle
+	polecat.UpdatedAt = time.Now()
+
+	return m.saveState(polecat)
+}
+
+// Reset forces a polecat to idle state regardless of current state.
+func (m *Manager) Reset(name string) error {
+	polecat, err := m.Get(name)
+	if err != nil {
+		return err
+	}
+
+	polecat.Issue = ""
+	polecat.State = StateIdle
+	polecat.UpdatedAt = time.Now()
+
+	return m.saveState(polecat)
+}
+
 // saveState persists polecat state to disk.
 func (m *Manager) saveState(polecat *Polecat) error {
 	data, err := json.MarshalIndent(polecat, "", "  ")

@@ -110,6 +110,39 @@ Example:
 	RunE: runPolecatSleep,
 }
 
+var polecatDoneCmd = &cobra.Command{
+	Use:     "done <rig>/<polecat>",
+	Aliases: []string{"finish"},
+	Short:   "Mark polecat as done with work and return to idle",
+	Long: `Mark polecat as done with work and return to idle.
+
+Transitions: working/done/stuck → idle
+Clears the assigned issue.
+Fails if session is running (stop first).
+
+Example:
+  gt polecat done gastown/Toast
+  gt polecat finish gastown/Toast`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPolecatDone,
+}
+
+var polecatResetCmd = &cobra.Command{
+	Use:   "reset <rig>/<polecat>",
+	Short: "Force reset polecat to idle state",
+	Long: `Force reset polecat to idle state.
+
+Transitions: any state → idle
+Clears the assigned issue.
+Use when polecat is stuck in an unexpected state.
+Fails if session is running (stop first).
+
+Example:
+  gt polecat reset gastown/Toast`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPolecatReset,
+}
+
 func init() {
 	// List flags
 	polecatListCmd.Flags().BoolVar(&polecatListJSON, "json", false, "Output as JSON")
@@ -124,6 +157,8 @@ func init() {
 	polecatCmd.AddCommand(polecatRemoveCmd)
 	polecatCmd.AddCommand(polecatWakeCmd)
 	polecatCmd.AddCommand(polecatSleepCmd)
+	polecatCmd.AddCommand(polecatDoneCmd)
+	polecatCmd.AddCommand(polecatResetCmd)
 
 	rootCmd.AddCommand(polecatCmd)
 }
@@ -358,5 +393,59 @@ func runPolecatSleep(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("%s Polecat %s is now idle.\n", style.SuccessPrefix, polecatName)
+	return nil
+}
+
+func runPolecatDone(cmd *cobra.Command, args []string) error {
+	rigName, polecatName, err := parseAddress(args[0])
+	if err != nil {
+		return err
+	}
+
+	mgr, r, err := getPolecatManager(rigName)
+	if err != nil {
+		return err
+	}
+
+	// Check if session is running
+	t := tmux.NewTmux()
+	sessMgr := session.NewManager(t, r)
+	running, _ := sessMgr.IsRunning(polecatName)
+	if running {
+		return fmt.Errorf("session is running. Stop it first with: gt session stop %s/%s", rigName, polecatName)
+	}
+
+	if err := mgr.Finish(polecatName); err != nil {
+		return fmt.Errorf("finishing polecat: %w", err)
+	}
+
+	fmt.Printf("%s Polecat %s is now idle.\n", style.SuccessPrefix, polecatName)
+	return nil
+}
+
+func runPolecatReset(cmd *cobra.Command, args []string) error {
+	rigName, polecatName, err := parseAddress(args[0])
+	if err != nil {
+		return err
+	}
+
+	mgr, r, err := getPolecatManager(rigName)
+	if err != nil {
+		return err
+	}
+
+	// Check if session is running
+	t := tmux.NewTmux()
+	sessMgr := session.NewManager(t, r)
+	running, _ := sessMgr.IsRunning(polecatName)
+	if running {
+		return fmt.Errorf("session is running. Stop it first with: gt session stop %s/%s", rigName, polecatName)
+	}
+
+	if err := mgr.Reset(polecatName); err != nil {
+		return fmt.Errorf("resetting polecat: %w", err)
+	}
+
+	fmt.Printf("%s Polecat %s has been reset to idle.\n", style.SuccessPrefix, polecatName)
 	return nil
 }
