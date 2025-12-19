@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -557,8 +558,9 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 
 	// Check if we're already in the target session
 	if isInTmuxSession(sessionID) {
-		fmt.Printf("Already in session %s\n", sessionID)
-		return nil
+		// We're in the session at a shell prompt - just start Claude directly
+		fmt.Printf("Starting Claude in current session...\n")
+		return execClaude()
 	}
 
 	// Attach to session using exec to properly forward TTY
@@ -574,6 +576,19 @@ func isShellCommand(cmd string) bool {
 		}
 	}
 	return false
+}
+
+// execClaude execs claude, replacing the current process.
+// Used when we're already in the target session and just need to start Claude.
+func execClaude() error {
+	claudePath, err := exec.LookPath("claude")
+	if err != nil {
+		return fmt.Errorf("claude not found: %w", err)
+	}
+
+	// exec replaces current process with claude
+	args := []string{"claude", "--dangerously-skip-permissions"}
+	return syscall.Exec(claudePath, args, os.Environ())
 }
 
 // isInTmuxSession checks if we're currently inside the target tmux session.
