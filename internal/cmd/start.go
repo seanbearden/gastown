@@ -3,11 +3,17 @@ package cmd
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
+)
+
+var (
+	shutdownGraceful bool
+	shutdownWait     int
 )
 
 var startCmd = &cobra.Command{
@@ -29,16 +35,22 @@ var shutdownCmd = &cobra.Command{
 	Short: "Shutdown Gas Town",
 	Long: `Shutdown Gas Town by stopping all agents.
 
+By default, immediately kills all sessions. Use --graceful to allow agents
+time to save their state and update handoff beads.
+
 Stops agents in the correct order:
 1. Deacon (health monitor) - so it doesn't restart others
 2. All polecats, witnesses, refineries, crew
-3. Mayor (global coordinator)
-
-This is a graceful shutdown that kills all Gas Town tmux sessions.`,
+3. Mayor (global coordinator)`,
 	RunE: runShutdown,
 }
 
 func init() {
+	shutdownCmd.Flags().BoolVarP(&shutdownGraceful, "graceful", "g", false,
+		"Send ESC to agents and wait for them to handoff before killing")
+	shutdownCmd.Flags().IntVarP(&shutdownWait, "wait", "w", 30,
+		"Seconds to wait for graceful shutdown (default 30)")
+
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(shutdownCmd)
 }
@@ -91,6 +103,106 @@ func runStart(cmd *cobra.Command, args []string) error {
 func runShutdown(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
+	if shutdownGraceful {
+		return runGracefulShutdown(t)
+	}
+	return runImmediateShutdown(t)
+}
+
+func runGracefulShutdown(t *tmux.Tmux) error {
+	fmt.Printf("Graceful shutdown of Gas Town (waiting up to %ds)...\n\n", shutdownWait)
+
+	// Collect all gt-* sessions
+	sessions, err := t.ListSessions()
+	if err != nil {
+		return fmt.Errorf("listing sessions: %w", err)
+	}
+
+	var gtSessions []string
+	for _, sess := range sessions {
+		if strings.HasPrefix(sess, "gt-") {
+			gtSessions = append(gtSessions, sess)
+		}
+	}
+
+	if len(gtSessions) == 0 {
+		fmt.Printf("%s Gas Town was not running\n", style.Dim.Render("○"))
+		return nil
+	}
+
+	// Phase 1: Send ESC to all agents to interrupt them
+	fmt.Printf("Phase 1: Sending ESC to %d agent(s)...\n", len(gtSessions))
+	for _, sess := range gtSessions {
+		fmt.Printf("  %s Interrupting %s\n", style.Bold.Render("→"), sess)
+		_ = t.SendKeysRaw(sess, "Escape")
+	}
+
+	// Phase 2: Send shutdown message asking agents to handoff
+	fmt.Printf("\nPhase 2: Requesting handoff from agents...\n")
+	shutdownMsg := "[SHUTDOWN] Gas Town is shutting down. Please save your state and update your handoff bead, then type /exit or wait to be terminated."
+	for _, sess := range gtSessions {
+		// Small delay then send the message
+		time.Sleep(500 * time.Millisecond)
+		_ = t.SendKeys(sess, shutdownMsg)
+	}
+
+	// Phase 3: Wait for agents to complete handoff
+	fmt.Printf("\nPhase 3: Waiting %ds for agents to complete handoff...\n", shutdownWait)
+	fmt.Printf("  %s\n", style.Dim.Render("(Press Ctrl-C to force immediate shutdown)"))
+
+	// Wait with countdown
+	for remaining := shutdownWait; remaining > 0; remaining -= 5 {
+		if remaining < shutdownWait {
+			fmt.Printf("  %s %ds remaining...\n", style.Dim.Render("⏳"), remaining)
+		}
+		sleepTime := 5
+		if remaining < 5 {
+			sleepTime = remaining
+		}
+		time.Sleep(time.Duration(sleepTime) * time.Second)
+	}
+
+	// Phase 4: Kill all sessions
+	fmt.Printf("\nPhase 4: Terminating sessions...\n")
+	stopped := 0
+
+	// Stop Deacon first
+	for _, sess := range gtSessions {
+		if sess == DeaconSessionName {
+			if err := t.KillSession(sess); err == nil {
+				fmt.Printf("  %s %s stopped\n", style.Bold.Render("✓"), sess)
+				stopped++
+			}
+		}
+	}
+
+	// Stop others (except Mayor)
+	for _, sess := range gtSessions {
+		if sess == DeaconSessionName || sess == MayorSessionName {
+			continue
+		}
+		if err := t.KillSession(sess); err == nil {
+			fmt.Printf("  %s %s stopped\n", style.Bold.Render("✓"), sess)
+			stopped++
+		}
+	}
+
+	// Stop Mayor last
+	for _, sess := range gtSessions {
+		if sess == MayorSessionName {
+			if err := t.KillSession(sess); err == nil {
+				fmt.Printf("  %s %s stopped\n", style.Bold.Render("✓"), sess)
+				stopped++
+			}
+		}
+	}
+
+	fmt.Println()
+	fmt.Printf("%s Graceful shutdown complete (%d sessions stopped)\n", style.Bold.Render("✓"), stopped)
+	return nil
+}
+
+func runImmediateShutdown(t *tmux.Tmux) error {
 	fmt.Println("Shutting down Gas Town...\n")
 
 	stopped := 0
