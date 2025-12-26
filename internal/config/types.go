@@ -99,6 +99,21 @@ type RigSettings struct {
 	MergeQueue *MergeQueueConfig `json:"merge_queue,omitempty"` // merge queue settings
 	Theme      *ThemeConfig      `json:"theme,omitempty"`       // tmux theme settings
 	Namepool   *NamepoolConfig   `json:"namepool,omitempty"`    // polecat name pool settings
+	Crew       *CrewConfig       `json:"crew,omitempty"`        // crew startup settings
+}
+
+// CrewConfig represents crew workspace settings for a rig.
+type CrewConfig struct {
+	// Startup is a natural language instruction for which crew to start on boot.
+	// Interpreted by AI during startup. Examples:
+	//   "max"                    - start only max
+	//   "joe and max"            - start joe and max
+	//   "all"                    - start all crew members
+	//   "pick one"               - start any one crew member
+	//   "none"                   - don't auto-start any crew
+	//   "max, but not emma"      - start max, skip emma
+	// If empty, defaults to starting no crew automatically.
+	Startup string `json:"startup,omitempty"`
 }
 
 // ThemeConfig represents tmux theme settings for a rig.
