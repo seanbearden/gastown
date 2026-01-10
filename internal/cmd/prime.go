@@ -29,7 +29,22 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-var primeHookMode bool
+var (
+	primeHookMode bool
+	primeDryRun   bool
+	primeState    bool
+	primeExplain  bool
+)
+
+// SessionState represents the detected session state for --state flag.
+type SessionState string
+
+const (
+	StateNormal        SessionState = "normal"
+	StatePostHandoff   SessionState = "post-handoff"
+	StateCrashRecovery SessionState = "crash-recovery"
+	StateAutonomous    SessionState = "autonomous"
+)
 
 // Role represents a detected agent role.
 type Role string
@@ -68,13 +83,36 @@ HOOK MODE (--hook):
   Claude Code sends JSON on stdin:
     {"session_id": "uuid", "transcript_path": "/path", "source": "startup|resume"}
 
-  Other agents can set GT_SESSION_ID environment variable instead.`,
+  Other agents can set GT_SESSION_ID environment variable instead.
+
+OBSERVABILITY FLAGS:
+  --dry-run (-n)  Preview mode: skip all side effects
+                  - Handoff marker not removed
+                  - bd prime not called
+                  - gt mail check --inject not called
+                  - Session events not emitted
+                  Useful for testing or debugging prime output.
+
+  --state         Output the detected session state and exit:
+                  - normal: Regular startup with no special context
+                  - post-handoff: Handoff marker was present (new session from handoff)
+                  - crash-recovery: Previous session checkpoint found
+                  - autonomous: Hooked work detected (GUPP applies)
+
+  --explain       Add [EXPLAIN] tags to output sections showing why they appear.
+                  Helps understand which conditions triggered each output block.`,
 	RunE: runPrime,
 }
 
 func init() {
 	primeCmd.Flags().BoolVar(&primeHookMode, "hook", false,
 		"Hook mode: read session ID from stdin JSON (for LLM runtime hooks)")
+	primeCmd.Flags().BoolVarP(&primeDryRun, "dry-run", "n", false,
+		"Show what would be done without side effects (no marker removal, no bd prime)")
+	primeCmd.Flags().BoolVar(&primeState, "state", false,
+		"Output detected session state (normal, post-handoff, crash-recovery, autonomous)")
+	primeCmd.Flags().BoolVar(&primeExplain, "explain", false,
+		"Add [EXPLAIN] tags showing why each output section appears")
 	rootCmd.AddCommand(primeCmd)
 }
 
@@ -107,7 +145,7 @@ func runPrime(cmd *cobra.Command, args []string) error {
 	}
 
 	// Handle hook mode: read session ID from stdin and persist it
-	if primeHookMode {
+	if primeHookMode && !primeDryRun {
 		sessionID, source := readHookSessionID()
 		persistSessionID(townRoot, sessionID)
 		if cwd != townRoot {
@@ -121,10 +159,29 @@ func runPrime(cmd *cobra.Command, args []string) error {
 		if source != "" {
 			fmt.Printf("[source:%s]\n", source)
 		}
+	} else if primeHookMode && primeDryRun {
+		explain("[EXPLAIN:hook-mode] Would read session ID from stdin and persist")
+		fmt.Printf("[dry-run] Would persist session ID\n")
+	}
+
+	// Detect session state for --state flag
+	// This checks for handoff marker, checkpoint, and hooked work
+	sessionState, stateReason := detectSessionState(cwd, townRoot)
+
+	// Handle --state flag: output state and exit
+	if primeState {
+		outputState(sessionState, stateReason)
+		return nil
 	}
 
 	// Check for handoff marker (prevents handoff loop bug)
-	checkHandoffMarker(cwd)
+	// In dry-run mode, we detected it above but don't remove it
+	if !primeDryRun {
+		checkHandoffMarker(cwd)
+	} else if sessionState == StatePostHandoff {
+		explain("[EXPLAIN:handoff-marker] Handoff marker present but not removed (dry-run)")
+		fmt.Printf("[dry-run] Would remove handoff marker and show HANDOFF COMPLETE warning\n")
+	}
 
 	// Get role using env-aware detection
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
@@ -134,6 +191,7 @@ func runPrime(cmd *cobra.Command, args []string) error {
 
 	// Warn prominently if there's a role/cwd mismatch
 	if roleInfo.Mismatch {
+		explain("[EXPLAIN:role-mismatch] GT_ROLE env differs from cwd-detected role")
 		fmt.Printf("\n%s\n", style.Bold.Render("⚠️  ROLE/LOCATION MISMATCH"))
 		fmt.Printf("You are %s (from $GT_ROLE) but your cwd suggests %s.\n",
 			style.Bold.Render(string(roleInfo.Role)),
@@ -157,13 +215,18 @@ func runPrime(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check and acquire identity lock for worker roles
-	if err := acquireIdentityLock(ctx); err != nil {
-		return err
+	if !primeDryRun {
+		if err := acquireIdentityLock(ctx); err != nil {
+			return err
+		}
+	} else if ctx.Role == RolePolecat || ctx.Role == RoleCrew {
+		explain("[EXPLAIN:identity-lock] Would acquire identity lock for worker role")
+		fmt.Printf("[dry-run] Would acquire identity lock\n")
 	}
 
 	// Ensure beads redirect exists for worktree-based roles
 	// Skip if there's a role/location mismatch to avoid creating bad redirects
-	if !roleInfo.Mismatch {
+	if !roleInfo.Mismatch && !primeDryRun {
 		ensureBeadsRedirect(ctx)
 	}
 
@@ -172,12 +235,18 @@ func runPrime(cmd *cobra.Command, args []string) error {
 	// "Discover, don't track" principle: reality is truth, state is derived.
 
 	// Emit session_start event for seance discovery
-	emitSessionEvent(ctx)
+	if !primeDryRun {
+		emitSessionEvent(ctx)
+	} else {
+		explain("[EXPLAIN:session-event] Would emit session_start event to .events.jsonl")
+		fmt.Printf("[dry-run] Would emit session_start event\n")
+	}
 
 	// Output session metadata for seance discovery
 	outputSessionMetadata(ctx)
 
 	// Output context
+	explain("[EXPLAIN:role-context] Outputting role-specific context for %s", ctx.Role)
 	if err := outputPrimeContext(ctx); err != nil {
 		return err
 	}
@@ -191,18 +260,34 @@ func runPrime(cmd *cobra.Command, args []string) error {
 	// Check for slung work on hook (from gt sling)
 	// If found, we're in autonomous mode - skip normal startup directive
 	hasSlungWork := checkSlungWork(ctx)
+	if hasSlungWork {
+		explain("[EXPLAIN:autonomous-mode] Hooked work found - GUPP applies")
+	}
 
 	// Output molecule context if working on a molecule step
 	outputMoleculeContext(ctx)
 
 	// Output previous session checkpoint for crash recovery
+	if sessionState == StateCrashRecovery {
+		explain("[EXPLAIN:crash-recovery] Previous session checkpoint found")
+	}
 	outputCheckpointContext(ctx)
 
 	// Run bd prime to output beads workflow context
-	runBdPrime(cwd)
+	if !primeDryRun {
+		runBdPrime(cwd)
+	} else {
+		explain("[EXPLAIN:bd-prime] Would run 'bd prime' to output beads workflow context")
+		fmt.Printf("[dry-run] Would run: bd prime\n")
+	}
 
 	// Run gt mail check --inject to inject any pending mail
-	runMailCheckInject(cwd)
+	if !primeDryRun {
+		runMailCheckInject(cwd)
+	} else {
+		explain("[EXPLAIN:mail-inject] Would run 'gt mail check --inject'")
+		fmt.Printf("[dry-run] Would run: gt mail check --inject\n")
+	}
 
 	// For Mayor, check for pending escalations
 	if ctx.Role == RoleMayor {
@@ -216,6 +301,63 @@ func runPrime(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// explain outputs an [EXPLAIN] tag if --explain flag is set.
+// Format arguments are supported like Printf.
+func explain(format string, args ...interface{}) {
+	if !primeExplain {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	fmt.Println(msg)
+}
+
+// detectSessionState determines the session state by checking for markers and context.
+// Returns the state and a human-readable reason string.
+func detectSessionState(cwd, townRoot string) (SessionState, string) {
+	// Check for handoff marker (post-handoff state)
+	markerPath := filepath.Join(cwd, constants.DirRuntime, constants.FileHandoffMarker)
+	if _, err := os.Stat(markerPath); err == nil {
+		return StatePostHandoff, "handoff marker present"
+	}
+
+	// Check for checkpoint (crash-recovery state)
+	cp, err := checkpoint.Read(cwd)
+	if err == nil && cp != nil && !cp.IsStale(24*time.Hour) {
+		return StateCrashRecovery, fmt.Sprintf("checkpoint from %s ago", cp.Age().Round(time.Minute))
+	}
+
+	// Check for hooked work (autonomous state)
+	// We need to do a lightweight check here without full role context
+	// Just check if there are any hooked beads in the work directory
+	b := beads.New(cwd)
+	hookedBeads, err := b.List(beads.ListOptions{
+		Status:   beads.StatusHooked,
+		Priority: -1,
+	})
+	if err == nil && len(hookedBeads) > 0 {
+		return StateAutonomous, fmt.Sprintf("hooked bead: %s", hookedBeads[0].ID)
+	}
+
+	// Also check in_progress beads as they indicate resumed work
+	inProgressBeads, err := b.List(beads.ListOptions{
+		Status:   "in_progress",
+		Priority: -1,
+	})
+	if err == nil && len(inProgressBeads) > 0 {
+		return StateAutonomous, fmt.Sprintf("in-progress bead: %s", inProgressBeads[0].ID)
+	}
+
+	return StateNormal, "no special context detected"
+}
+
+// outputState outputs the session state for --state flag and exits.
+func outputState(state SessionState, reason string) {
+	fmt.Printf("%s\n", state)
+	if reason != "" {
+		fmt.Printf("reason: %s\n", reason)
+	}
 }
 
 func detectRole(cwd, townRoot string) RoleInfo {
