@@ -745,7 +745,9 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 
 	// Check if polecat has hooked work
 	if info.HookBead == "" {
-		// No hooked work - no need to restart (polecat was idle)
+		// No hooked work - polecat may have self-cleaned or is orphaned.
+		// In the self-cleaning model, polecats nuke themselves after work.
+		// Don't restart polecats without work assignments.
 		return
 	}
 

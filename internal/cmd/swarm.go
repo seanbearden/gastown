@@ -131,11 +131,14 @@ Transitions the swarm from 'created' to 'active' state.`,
 
 var swarmDispatchCmd = &cobra.Command{
 	Use:   "dispatch <epic-id>",
-	Short: "Assign next ready task to an idle worker",
-	Long: `Dispatch the next ready task from an epic to an available worker.
+	Short: "Spawn a fresh polecat for the next ready task",
+	Long: `Dispatch the next ready task from an epic to a fresh polecat.
 
-Finds the first unassigned task in the epic's ready front and slings it
-to an idle polecat in the rig.
+Finds the first unassigned task in the epic's ready front and spawns
+a fresh polecat to work on it. Uses gt sling which auto-spawns polecats.
+
+Self-Cleaning Model: Polecats are always spawned fresh for work. There are
+no "idle" polecats to reuse - polecats nuke themselves after completing work.
 
 Examples:
   gt swarm dispatch gt-abc         # Dispatch next task from epic gt-abc
@@ -458,49 +461,16 @@ func runSwarmDispatch(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Find idle polecats (no hooked work)
-	polecatGit := git.NewGit(foundRig.Path)
-	polecatMgr := polecat.NewManager(foundRig, polecatGit)
-	polecats, err := polecatMgr.List()
-	if err != nil {
-		return fmt.Errorf("listing polecats: %w", err)
-	}
-
-	// Check which polecats have no hooked work
-	var idlePolecats []string
-	for _, p := range polecats {
-		// Check if polecat has hooked work by querying beads
-		hookCheckCmd := exec.Command("bd", "list", "--status=hooked", "--assignee", fmt.Sprintf("%s/polecats/%s", foundRig.Name, p.Name), "--json")
-		hookCheckCmd.Dir = foundRig.BeadsPath()
-		var hookOut bytes.Buffer
-		hookCheckCmd.Stdout = &hookOut
-		if err := hookCheckCmd.Run(); err == nil {
-			var hooked []interface{}
-			if err := json.Unmarshal(hookOut.Bytes(), &hooked); err == nil && len(hooked) == 0 {
-				idlePolecats = append(idlePolecats, p.Name)
-			}
-		}
-	}
-
-	if len(idlePolecats) == 0 {
-		fmt.Println("No idle polecats available")
-		fmt.Printf("\nUnassigned ready tasks:\n")
-		for _, task := range unassigned {
-			fmt.Printf("  ○ %s: %s\n", task.ID, task.Title)
-		}
-		fmt.Printf("\nCreate a new polecat or wait for one to become idle.\n")
-		return nil
-	}
-
-	// Dispatch first unassigned task to first idle polecat
+	// Self-Cleaning Model: Always spawn fresh polecats for work.
+	// There are no "idle" polecats to reuse - polecats nuke themselves
+	// after completing work. gt sling auto-spawns a fresh polecat.
 	task := unassigned[0]
-	worker := idlePolecats[0]
-	target := fmt.Sprintf("%s/%s", foundRig.Name, worker)
 
-	fmt.Printf("Dispatching %s to %s...\n", task.ID, target)
+	fmt.Printf("Spawning fresh polecat for %s: %s...\n", task.ID, task.Title)
 
-	// Use gt sling to assign the task
-	slingCmd := exec.Command("gt", "sling", task.ID, target)
+	// Use gt sling to spawn a fresh polecat and assign the task
+	// gt sling <bead> <rig> auto-spawns a polecat in the rig
+	slingCmd := exec.Command("gt", "sling", task.ID, foundRig.Name)
 	slingCmd.Dir = townRoot
 	slingCmd.Stdout = os.Stdout
 	slingCmd.Stderr = os.Stderr
@@ -509,14 +479,11 @@ func runSwarmDispatch(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("slinging task: %w", err)
 	}
 
-	fmt.Printf("%s Dispatched %s: %s → %s\n", style.Bold.Render("✓"), task.ID, task.Title, target)
+	fmt.Printf("%s Dispatched %s: %s → %s (fresh polecat)\n", style.Bold.Render("✓"), task.ID, task.Title, foundRig.Name)
 
-	// Show remaining tasks and workers
+	// Show remaining tasks
 	if len(unassigned) > 1 {
 		fmt.Printf("\n%d more ready tasks available\n", len(unassigned)-1)
-	}
-	if len(idlePolecats) > 1 {
-		fmt.Printf("%d more idle polecats available\n", len(idlePolecats)-1)
 	}
 
 	return nil
