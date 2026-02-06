@@ -3,11 +3,9 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -43,25 +41,6 @@ func init() {
 	hooksScanCmd.Flags().BoolVarP(&hooksScanVerbose, "verbose", "v", false, "Show hook commands")
 }
 
-// ClaudeSettings represents the Claude Code settings.json structure.
-type ClaudeSettings struct {
-	EditorMode     string                         `json:"editorMode,omitempty"`
-	EnabledPlugins map[string]bool                `json:"enabledPlugins,omitempty"`
-	Hooks          map[string][]ClaudeHookMatcher `json:"hooks,omitempty"`
-}
-
-// ClaudeHookMatcher represents a hook matcher entry.
-type ClaudeHookMatcher struct {
-	Matcher string       `json:"matcher"`
-	Hooks   []ClaudeHook `json:"hooks"`
-}
-
-// ClaudeHook represents an individual hook.
-type ClaudeHook struct {
-	Type    string `json:"type"`
-	Command string `json:"command,omitempty"`
-}
-
 // HookInfo contains information about a discovered hook.
 type HookInfo struct {
 	Type     string   `json:"type"`     // Hook type (SessionStart, etc.)
@@ -85,153 +64,61 @@ func runHooksScan(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	// Find all .claude/settings.json files
-	hooks, err := discoverHooks(townRoot)
+	// Find all .claude/settings.json files via DiscoverTargets
+	hookInfos, err := discoverHooks(townRoot)
 	if err != nil {
 		return fmt.Errorf("discovering hooks: %w", err)
 	}
 
 	if hooksScanJSON {
-		return outputHooksJSON(townRoot, hooks)
+		return outputHooksJSON(townRoot, hookInfos)
 	}
 
-	return outputHooksHuman(townRoot, hooks)
+	return outputHooksHuman(townRoot, hookInfos)
 }
 
-// discoverHooks finds all Claude Code hooks in the workspace.
+// discoverHooks finds all Claude Code hooks in the workspace using hooks.DiscoverTargets.
 func discoverHooks(townRoot string) ([]HookInfo, error) {
-	var hooks []HookInfo
-
-	// Scan known locations for .claude/settings.json
-	// NOTE: Mayor settings are at ~/gt/mayor/.claude/, NOT ~/gt/.claude/
-	// Settings at town root would pollute all child workspaces.
-	locations := []struct {
-		path  string
-		agent string
-	}{
-		{filepath.Join(townRoot, "mayor", ".claude", "settings.json"), "mayor/"},
-		{filepath.Join(townRoot, "deacon", ".claude", "settings.json"), "deacon/"},
-	}
-
-	// Scan rigs
-	entries, err := os.ReadDir(townRoot)
+	targets, err := hooks.DiscoverTargets(townRoot)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == ".beads" || strings.HasPrefix(entry.Name(), ".") {
-			continue
-		}
+	var infos []HookInfo
 
-		rigName := entry.Name()
-		rigPath := filepath.Join(townRoot, rigName)
-
-		// Rig-level hooks
-		locations = append(locations, struct {
-			path  string
-			agent string
-		}{filepath.Join(rigPath, ".claude", "settings.json"), fmt.Sprintf("%s/rig", rigName)})
-
-		// Polecats-level hooks (inherited by all polecats)
-		polecatsDir := filepath.Join(rigPath, "polecats")
-		locations = append(locations, struct {
-			path  string
-			agent string
-		}{filepath.Join(polecatsDir, ".claude", "settings.json"), fmt.Sprintf("%s/polecats", rigName)})
-
-		// Individual polecat hooks
-		if polecats, err := os.ReadDir(polecatsDir); err == nil {
-			for _, p := range polecats {
-				if p.IsDir() && !strings.HasPrefix(p.Name(), ".") {
-					locations = append(locations, struct {
-						path  string
-						agent string
-					}{filepath.Join(polecatsDir, p.Name(), ".claude", "settings.json"), fmt.Sprintf("%s/%s", rigName, p.Name())})
-				}
-			}
-		}
-
-		// Crew-level hooks (inherited by all crew members)
-		crewDir := filepath.Join(rigPath, "crew")
-		locations = append(locations, struct {
-			path  string
-			agent string
-		}{filepath.Join(crewDir, ".claude", "settings.json"), fmt.Sprintf("%s/crew", rigName)})
-
-		// Individual crew member hooks
-		if crew, err := os.ReadDir(crewDir); err == nil {
-			for _, c := range crew {
-				if c.IsDir() && !strings.HasPrefix(c.Name(), ".") {
-					locations = append(locations, struct {
-						path  string
-						agent string
-					}{filepath.Join(crewDir, c.Name(), ".claude", "settings.json"), fmt.Sprintf("%s/crew/%s", rigName, c.Name())})
-				}
-			}
-		}
-
-		// Witness
-		witnessPath := filepath.Join(rigPath, "witness", ".claude", "settings.json")
-		locations = append(locations, struct {
-			path  string
-			agent string
-		}{witnessPath, fmt.Sprintf("%s/witness", rigName)})
-
-		// Refinery
-		refineryPath := filepath.Join(rigPath, "refinery", ".claude", "settings.json")
-		locations = append(locations, struct {
-			path  string
-			agent string
-		}{refineryPath, fmt.Sprintf("%s/refinery", rigName)})
-	}
-
-	// Process each location
-	for _, loc := range locations {
-		if _, err := os.Stat(loc.path); os.IsNotExist(err) {
-			continue
-		}
-
-		found, err := parseHooksFile(loc.path, loc.agent)
+	for _, target := range targets {
+		settings, err := hooks.LoadSettings(target.Path)
 		if err != nil {
-			// Skip files that can't be parsed
-			continue
+			continue // Skip files that can't be parsed
 		}
-		hooks = append(hooks, found...)
+
+		found := extractHookInfos(settings, target.Path, target.DisplayKey())
+		infos = append(infos, found...)
 	}
 
-	return hooks, nil
+	return infos, nil
 }
 
-// parseHooksFile parses a .claude/settings.json file and extracts hooks.
-func parseHooksFile(path, agent string) ([]HookInfo, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+// extractHookInfos extracts HookInfo entries from a loaded settings file.
+func extractHookInfos(settings *hooks.SettingsJSON, path, agent string) []HookInfo {
+	var infos []HookInfo
 
-	var settings ClaudeSettings
-	if err := json.Unmarshal(data, &settings); err != nil {
-		return nil, err
-	}
-
-	var hooks []HookInfo
-
-	for hookType, matchers := range settings.Hooks {
-		for _, matcher := range matchers {
+	for _, eventType := range hooks.EventTypes {
+		entries := settings.Hooks.GetEntries(eventType)
+		for _, entry := range entries {
 			var commands []string
-			for _, h := range matcher.Hooks {
+			for _, h := range entry.Hooks {
 				if h.Command != "" {
 					commands = append(commands, h.Command)
 				}
 			}
 
 			if len(commands) > 0 {
-				hooks = append(hooks, HookInfo{
-					Type:     hookType,
+				infos = append(infos, HookInfo{
+					Type:     eventType,
 					Location: path,
 					Agent:    agent,
-					Matcher:  matcher.Matcher,
+					Matcher:  entry.Matcher,
 					Commands: commands,
 					Status:   "active",
 				})
@@ -239,14 +126,25 @@ func parseHooksFile(path, agent string) ([]HookInfo, error) {
 		}
 	}
 
-	return hooks, nil
+	return infos
 }
 
-func outputHooksJSON(townRoot string, hooks []HookInfo) error {
+// parseHooksFile parses a .claude/settings.json file and extracts hooks.
+func parseHooksFile(path, agent string) ([]HookInfo, error) {
+	settings, err := hooks.LoadSettings(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// LoadSettings returns zero-value for missing files; check if it was actually empty
+	return extractHookInfos(settings, path, agent), nil
+}
+
+func outputHooksJSON(townRoot string, hookInfos []HookInfo) error {
 	output := HooksOutput{
 		TownRoot: townRoot,
-		Hooks:    hooks,
-		Count:    len(hooks),
+		Hooks:    hookInfos,
+		Count:    len(hookInfos),
 	}
 
 	data, err := json.MarshalIndent(output, "", "  ")
@@ -258,8 +156,8 @@ func outputHooksJSON(townRoot string, hooks []HookInfo) error {
 	return nil
 }
 
-func outputHooksHuman(townRoot string, hooks []HookInfo) error {
-	if len(hooks) == 0 {
+func outputHooksHuman(townRoot string, hookInfos []HookInfo) error {
+	if len(hookInfos) == 0 {
 		fmt.Println(style.Dim.Render("No Claude Code hooks found in workspace"))
 		return nil
 	}
@@ -269,13 +167,14 @@ func outputHooksHuman(townRoot string, hooks []HookInfo) error {
 
 	// Group by hook type
 	byType := make(map[string][]HookInfo)
-	typeOrder := []string{"SessionStart", "PreCompact", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
 
-	for _, h := range hooks {
+	for _, h := range hookInfos {
 		byType[h.Type] = append(byType[h.Type], h)
 	}
 
-	// Add any types not in the predefined order
+	// Use canonical event type order, plus any extras
+	typeOrder := make([]string, len(hooks.EventTypes))
+	copy(typeOrder, hooks.EventTypes)
 	for t := range byType {
 		found := false
 		for _, o := range typeOrder {
@@ -319,7 +218,7 @@ func outputHooksHuman(townRoot string, hooks []HookInfo) error {
 		fmt.Println()
 	}
 
-	fmt.Printf("%s %d hooks found\n", style.Dim.Render("Total:"), len(hooks))
+	fmt.Printf("%s %d hooks found\n", style.Dim.Render("Total:"), len(hookInfos))
 
 	return nil
 }

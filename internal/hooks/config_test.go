@@ -130,6 +130,8 @@ func TestValidTarget(t *testing.T) {
 		{"polecats", true},
 		{"mayor", true},
 		{"deacon", true},
+		{"rig", true},
+		{"gastown/rig", true},
 		{"gastown/crew", true},
 		{"beads/witness", true},
 		{"sky/polecats", true},
@@ -450,6 +452,105 @@ func TestTargetDisplayKey(t *testing.T) {
 		if got := tt.target.DisplayKey(); got != tt.expected {
 			t.Errorf("DisplayKey() = %q, want %q", got, tt.expected)
 		}
+	}
+}
+
+func TestGetSetEntries(t *testing.T) {
+	cfg := &HooksConfig{
+		SessionStart: []HookEntry{
+			{Matcher: "", Hooks: []Hook{{Type: "command", Command: "test"}}},
+		},
+	}
+
+	// GetEntries for existing type
+	entries := cfg.GetEntries("SessionStart")
+	if len(entries) != 1 {
+		t.Errorf("expected 1 SessionStart entry, got %d", len(entries))
+	}
+
+	// GetEntries for empty type
+	entries = cfg.GetEntries("PreToolUse")
+	if len(entries) != 0 {
+		t.Errorf("expected 0 PreToolUse entries, got %d", len(entries))
+	}
+
+	// GetEntries for unknown type
+	entries = cfg.GetEntries("Unknown")
+	if entries != nil {
+		t.Errorf("expected nil for unknown event type, got %v", entries)
+	}
+
+	// SetEntries
+	cfg.SetEntries("PreToolUse", []HookEntry{
+		{Matcher: "Bash(*)", Hooks: []Hook{{Type: "command", Command: "guard"}}},
+	})
+	if len(cfg.PreToolUse) != 1 {
+		t.Errorf("expected 1 PreToolUse entry after SetEntries, got %d", len(cfg.PreToolUse))
+	}
+}
+
+func TestToMap(t *testing.T) {
+	cfg := &HooksConfig{
+		SessionStart: []HookEntry{
+			{Matcher: "", Hooks: []Hook{{Type: "command", Command: "start"}}},
+		},
+		Stop: []HookEntry{
+			{Matcher: "", Hooks: []Hook{{Type: "command", Command: "stop"}}},
+		},
+	}
+
+	m := cfg.ToMap()
+	if len(m) != 2 {
+		t.Errorf("expected 2 entries in map, got %d", len(m))
+	}
+	if _, ok := m["SessionStart"]; !ok {
+		t.Error("expected SessionStart in map")
+	}
+	if _, ok := m["Stop"]; !ok {
+		t.Error("expected Stop in map")
+	}
+	if _, ok := m["PreToolUse"]; ok {
+		t.Error("empty PreToolUse should not be in map")
+	}
+}
+
+func TestAddEntry(t *testing.T) {
+	cfg := &HooksConfig{}
+
+	// Add first entry
+	added := cfg.AddEntry("PreToolUse", HookEntry{
+		Matcher: "Bash(git*)",
+		Hooks:   []Hook{{Type: "command", Command: "guard"}},
+	})
+	if !added {
+		t.Error("expected first entry to be added")
+	}
+	if len(cfg.PreToolUse) != 1 {
+		t.Errorf("expected 1 PreToolUse entry, got %d", len(cfg.PreToolUse))
+	}
+
+	// Try adding duplicate matcher - should not add
+	added = cfg.AddEntry("PreToolUse", HookEntry{
+		Matcher: "Bash(git*)",
+		Hooks:   []Hook{{Type: "command", Command: "different"}},
+	})
+	if added {
+		t.Error("expected duplicate matcher to not be added")
+	}
+	if len(cfg.PreToolUse) != 1 {
+		t.Errorf("expected still 1 PreToolUse entry, got %d", len(cfg.PreToolUse))
+	}
+
+	// Add different matcher - should add
+	added = cfg.AddEntry("PreToolUse", HookEntry{
+		Matcher: "Bash(rm*)",
+		Hooks:   []Hook{{Type: "command", Command: "block"}},
+	})
+	if !added {
+		t.Error("expected new matcher to be added")
+	}
+	if len(cfg.PreToolUse) != 2 {
+		t.Errorf("expected 2 PreToolUse entries, got %d", len(cfg.PreToolUse))
 	}
 }
 

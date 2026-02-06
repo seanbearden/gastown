@@ -109,6 +109,7 @@ func ValidTarget(target string) bool {
 	validRoles := map[string]bool{
 		"crew": true, "witness": true, "refinery": true,
 		"polecats": true, "mayor": true, "deacon": true,
+		"rig": true,
 	}
 
 	// Simple role target
@@ -422,6 +423,72 @@ func (t Target) DisplayKey() string {
 		return t.Rig + "/" + t.Role
 	}
 	return t.Role
+}
+
+// EventTypes returns the known hook event type names in display order.
+var EventTypes = []string{"PreToolUse", "PostToolUse", "SessionStart", "Stop", "PreCompact", "UserPromptSubmit"}
+
+// GetEntries returns the hook entries for a given event type.
+func (c *HooksConfig) GetEntries(eventType string) []HookEntry {
+	switch eventType {
+	case "PreToolUse":
+		return c.PreToolUse
+	case "PostToolUse":
+		return c.PostToolUse
+	case "SessionStart":
+		return c.SessionStart
+	case "Stop":
+		return c.Stop
+	case "PreCompact":
+		return c.PreCompact
+	case "UserPromptSubmit":
+		return c.UserPromptSubmit
+	default:
+		return nil
+	}
+}
+
+// SetEntries sets the hook entries for a given event type.
+func (c *HooksConfig) SetEntries(eventType string, entries []HookEntry) {
+	switch eventType {
+	case "PreToolUse":
+		c.PreToolUse = entries
+	case "PostToolUse":
+		c.PostToolUse = entries
+	case "SessionStart":
+		c.SessionStart = entries
+	case "Stop":
+		c.Stop = entries
+	case "PreCompact":
+		c.PreCompact = entries
+	case "UserPromptSubmit":
+		c.UserPromptSubmit = entries
+	}
+}
+
+// ToMap converts HooksConfig to a map for iteration over non-empty event types.
+func (c *HooksConfig) ToMap() map[string][]HookEntry {
+	m := make(map[string][]HookEntry)
+	for _, et := range EventTypes {
+		entries := c.GetEntries(et)
+		if len(entries) > 0 {
+			m[et] = entries
+		}
+	}
+	return m
+}
+
+// AddEntry appends a hook entry to the given event type if the matcher doesn't already exist.
+// Returns true if the entry was added.
+func (c *HooksConfig) AddEntry(eventType string, entry HookEntry) bool {
+	entries := c.GetEntries(eventType)
+	for _, e := range entries {
+		if e.Matcher == entry.Matcher {
+			return false
+		}
+	}
+	c.SetEntries(eventType, append(entries, entry))
+	return true
 }
 
 // loadConfig loads a HooksConfig from a JSON file.

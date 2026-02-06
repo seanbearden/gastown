@@ -12,10 +12,7 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-var (
-	hooksSyncDryRun bool
-	hooksSyncForce  bool
-)
+var hooksSyncDryRun bool
 
 var hooksSyncCmd = &cobra.Command{
 	Use:   "sync",
@@ -31,15 +28,13 @@ For each target (mayor, deacon, rig/crew, rig/witness, etc.):
 
 Examples:
   gt hooks sync             # Regenerate all settings.json files
-  gt hooks sync --dry-run   # Show what would change without writing
-  gt hooks sync --force     # Overwrite even if local modifications detected`,
+  gt hooks sync --dry-run   # Show what would change without writing`,
 	RunE: runHooksSync,
 }
 
 func init() {
 	hooksCmd.AddCommand(hooksSyncCmd)
 	hooksSyncCmd.Flags().BoolVar(&hooksSyncDryRun, "dry-run", false, "Show what would change without writing")
-	hooksSyncCmd.Flags().BoolVar(&hooksSyncForce, "force", false, "Overwrite even if local modifications detected")
 }
 
 func runHooksSync(cmd *cobra.Command, args []string) error {

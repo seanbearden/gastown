@@ -142,14 +142,14 @@ func outputListJSON(infos []listTargetInfo) error {
 }
 
 func outputListHuman(infos []listTargetInfo) error {
-	// Calculate column widths
+	// Calculate column widths based on visible text (excluding ANSI codes)
 	targetWidth := len("Target")
 	overridesWidth := len("Overrides")
 	for _, info := range infos {
 		if len(info.Target) > targetWidth {
 			targetWidth = len(info.Target)
 		}
-		overrideStr := formatOverrides(info.Overrides)
+		overrideStr := formatOverridesPlain(info.Overrides)
 		if len(overrideStr) > overridesWidth {
 			overridesWidth = len(overrideStr)
 		}
@@ -163,21 +163,25 @@ func outputListHuman(infos []listTargetInfo) error {
 		overridesWidth = 35
 	}
 
-	// Header
-	fmt.Printf("%-*s  %-*s  %s\n",
-		targetWidth, style.Bold.Render("Target"),
-		overridesWidth, style.Bold.Render("Overrides"),
+	// Header - pad plain text first, then style
+	fmt.Printf("%s  %s  %s\n",
+		style.Bold.Render(padRight("Target", targetWidth)),
+		style.Bold.Render(padRight("Overrides", overridesWidth)),
 		style.Bold.Render("Status"))
 
-	// Rows
+	// Rows - pad plain text content, then apply styles
 	for _, info := range infos {
-		overrideStr := formatOverrides(info.Overrides)
+		overridePlain := formatOverridesPlain(info.Overrides)
+		overrideStyled := formatOverrides(info.Overrides)
 		statusStr := renderSyncStatus(info.Status)
 
-		fmt.Printf("%-*s  %-*s  %s\n",
-			targetWidth, info.Target,
-			overridesWidth, overrideStr,
-			statusStr)
+		// Pad target (plain text, no ANSI)
+		targetPadded := padRight(info.Target, targetWidth)
+
+		// For overrides, add padding based on visible width difference
+		overridePadded := overrideStyled + padRight("", overridesWidth-len(overridePlain))
+
+		fmt.Printf("%s  %s  %s\n", targetPadded, overridePadded, statusStr)
 	}
 
 	// Footer
@@ -212,11 +216,23 @@ func formatOverrides(overrides []string) string {
 	if len(overrides) == 0 {
 		return style.Dim.Render("(none)")
 	}
-	formatted := make([]string, len(overrides))
-	for i, o := range overrides {
-		formatted[i] = o
+	return "[" + strings.Join(overrides, ", ") + "]"
+}
+
+// formatOverridesPlain returns the plain-text override string without ANSI codes.
+func formatOverridesPlain(overrides []string) string {
+	if len(overrides) == 0 {
+		return "(none)"
 	}
-	return "[" + strings.Join(formatted, ", ") + "]"
+	return "[" + strings.Join(overrides, ", ") + "]"
+}
+
+// padRight pads s with spaces to width. If s is already >= width, returns s unchanged.
+func padRight(s string, width int) string {
+	if len(s) >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-len(s))
 }
 
 func renderSyncStatus(status string) string {
