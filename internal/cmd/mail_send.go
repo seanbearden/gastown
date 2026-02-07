@@ -128,9 +128,10 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Route based on recipient type
+	// Route based on recipient type, collecting errors instead of failing early
 	router := mail.NewRouter(workDir)
 	var recipientAddrs []string
+	var sendErrs []string
 
 	for _, rec := range recipients {
 		switch rec.Type {
@@ -138,7 +139,8 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			// Queue messages: single message, workers claim
 			msg.To = rec.Address
 			if err := router.Send(msg); err != nil {
-				return fmt.Errorf("sending to queue: %w", err)
+				sendErrs = append(sendErrs, fmt.Sprintf("queue %s: %v", rec.Address, err))
+				continue
 			}
 			recipientAddrs = append(recipientAddrs, rec.Address)
 
@@ -146,7 +148,8 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			// Channel messages: single message, broadcast
 			msg.To = rec.Address
 			if err := router.Send(msg); err != nil {
-				return fmt.Errorf("sending to channel: %w", err)
+				sendErrs = append(sendErrs, fmt.Sprintf("channel %s: %v", rec.Address, err))
+				continue
 			}
 			recipientAddrs = append(recipientAddrs, rec.Address)
 
@@ -155,10 +158,18 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			msgCopy := *msg
 			msgCopy.To = rec.Address
 			if err := router.Send(&msgCopy); err != nil {
-				return fmt.Errorf("sending to %s: %w", rec.Address, err)
+				sendErrs = append(sendErrs, fmt.Sprintf("%s: %v", rec.Address, err))
+				continue
 			}
 			recipientAddrs = append(recipientAddrs, rec.Address)
 		}
+	}
+
+	if len(sendErrs) > 0 {
+		if len(recipientAddrs) == 0 {
+			return fmt.Errorf("all sends failed: %s", strings.Join(sendErrs, "; "))
+		}
+		fmt.Fprintf(os.Stderr, "⚠ Some deliveries failed: %s\n", strings.Join(sendErrs, "; "))
 	}
 
 	// Log mail event to activity feed
