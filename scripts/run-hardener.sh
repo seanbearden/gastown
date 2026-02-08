@@ -1,40 +1,29 @@
 #!/usr/bin/env bash
-# One-shot launcher for migration hardener agent.
-# Intended to be run inside a tmux session.
+# run-hardener.sh — Launch migration hardener agent in a tmux session
+#
+# Usage: ./scripts/run-hardener.sh
+#
+# Launches claude in a tmux session, then uses gt nudge to send the initial
+# prompt (tmux send-keys + Enter doesn't work with Claude Code TUI).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+SESSION_NAME="migration-hardener"
 
-MISSION="$REPO_ROOT/.claude/agents/at-migration-mission.md"
-SYSTEM_PROMPT="$(cat "$MISSION")
+# Kill existing session if any
+tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 
----
+# Launch claude (skip project hooks — gt prime --hook hangs without GT_ROLE)
+tmux new-session -d -s "$SESSION_NAME" -c "$REPO_ROOT" \
+    "claude --dangerously-skip-permissions --setting-sources user"
 
-You are a solo migration hardening agent. Work through the mission above
-systematically, phase by phase. You have full autonomy.
+echo "Waiting for session to initialize..."
+sleep 8
 
-Working directory: $REPO_ROOT
-Push target: origin/main (direct push, no PRs)
-VM: migration-test-lab (access via: gcloud compute ssh migration-test-lab --zone=us-west1-b)
+# Send initial prompt via gt nudge (reliable text delivery to Claude Code TUI)
+gt nudge "$SESSION_NAME" "You are a solo migration hardening agent. Read .claude/agents/at-migration-mission.md for your full mission and .claude/agents/migration-hardener.md for your role context. Execute all 5 phases autonomously. Push directly to main. VM access: gcloud compute ssh migration-test-lab --zone=us-west1-b. Start Phase 1 now."
 
-WORKFLOW:
-1. Phase 1 (Audit) — read all migration code, catalog gaps
-2. Phase 2 — work through the edge case matrix, writing Go tests
-3. Phase 3 — fix bugs you discover
-4. Phase 4 — VM integration tests with multiple configurations
-5. Phase 5 — document and report
-
-CRITICAL REMINDERS:
-- Run 'go test ./... && golangci-lint run ./...' before every push
-- After EVERY migration test: check for zombie artifacts (bd daemons, SQLite files, JSONL files)
-- Commit frequently, push to main regularly
-- Use TaskCreate to track your progress through the edge case matrix
-- If context gets full, commit+push everything, then start a new session and continue
-
-START NOW. Begin with Phase 1 — read the migration code."
-
-exec claude \
-    --permission-mode acceptEdits \
-    --agent migration-hardener \
-    --append-system-prompt "$SYSTEM_PROMPT"
+echo ""
+echo "Migration hardener launched in tmux session: $SESSION_NAME"
+echo "  Monitor: tmux attach -t $SESSION_NAME"
+echo "  Check:   tmux capture-pane -t $SESSION_NAME -p | tail -20"
