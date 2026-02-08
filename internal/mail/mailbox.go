@@ -128,7 +128,9 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 		"--limit", "0",
 	}
 
-	stdout, err := runBdCommand(args, m.workDir, beadsDir)
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +263,9 @@ func (m *Mailbox) getBeads(id string) (*Message, error) {
 func (m *Mailbox) getFromDir(id, beadsDir string) (*Message, error) {
 	args := []string{"show", id, "--json"}
 
-	stdout, err := runBdCommand(args, m.workDir, beadsDir)
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
 	if err != nil {
 		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
 			return nil, ErrMessageNotFound
@@ -316,7 +320,9 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 		args = append(args, "--session="+sessionID)
 	}
 
-	_, err := runBdCommand(args, m.workDir, beadsDir)
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	_, err := runBdCommand(ctx, args, m.workDir, beadsDir)
 	if err != nil {
 		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
 			return ErrMessageNotFound
@@ -363,7 +369,9 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 	// Add "read" label to mark as read without closing
 	args := []string{"label", "add", id, "read"}
 
-	_, err := runBdCommand(args, m.workDir, m.beadsDir)
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	_, err := runBdCommand(ctx, args, m.workDir, m.beadsDir)
 	if err != nil {
 		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
 			return ErrMessageNotFound
@@ -388,7 +396,9 @@ func (m *Mailbox) markUnreadOnlyBeads(id string) error {
 	// Remove "read" label to mark as unread
 	args := []string{"label", "remove", id, "read"}
 
-	_, err := runBdCommand(args, m.workDir, m.beadsDir)
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	_, err := runBdCommand(ctx, args, m.workDir, m.beadsDir)
 	if err != nil {
 		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
 			return ErrMessageNotFound
@@ -414,7 +424,9 @@ func (m *Mailbox) MarkUnread(id string) error {
 func (m *Mailbox) markUnreadBeads(id string) error {
 	args := []string{"reopen", id}
 
-	_, err := runBdCommand(args, m.workDir, m.beadsDir)
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	_, err := runBdCommand(ctx, args, m.workDir, m.beadsDir)
 	if err != nil {
 		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
 			return ErrMessageNotFound
@@ -804,7 +816,9 @@ func (m *Mailbox) ListByThread(threadID string) ([]*Message, error) {
 func (m *Mailbox) listByThreadBeads(threadID string) ([]*Message, error) {
 	args := []string{"message", "thread", threadID, "--json"}
 
-	stdout, err := runBdCommand(args, m.workDir, m.beadsDir, "BD_IDENTITY="+m.identity)
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	stdout, err := runBdCommand(ctx, args, m.workDir, m.beadsDir, "BD_IDENTITY="+m.identity)
 	if err != nil {
 		return nil, err
 	}
