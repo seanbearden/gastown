@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/help"
@@ -121,6 +122,19 @@ func loadConvoys(townBeads string) ([]ConvoyItem, error) {
 	return convoys, nil
 }
 
+// extractIssueID strips the external:prefix:id wrapper from bead IDs.
+// formatTrackBeadID() wraps cross-rig IDs as "external:prefix:id" for routing,
+// but consumers need the raw bead ID for display and lookups.
+func extractIssueID(id string) string {
+	if strings.HasPrefix(id, "external:") {
+		parts := strings.SplitN(id, ":", 3)
+		if len(parts) == 3 {
+			return parts[2]
+		}
+	}
+	return id
+}
+
 // loadTrackedIssues loads issues tracked by a convoy.
 func loadTrackedIssues(townBeads, convoyID string) ([]IssueItem, int, int) {
 	// Validate convoy ID for safety
@@ -154,7 +168,7 @@ func loadTrackedIssues(townBeads, convoyID string) ([]IssueItem, int, int) {
 	completed := 0
 	for _, t := range tracked {
 		issues = append(issues, IssueItem{
-			ID:     t.ID,
+			ID:     extractIssueID(t.ID),
 			Title:  t.Title,
 			Status: t.Status,
 		})

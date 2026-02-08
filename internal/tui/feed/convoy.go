@@ -155,6 +155,19 @@ type trackedStatus struct {
 	Status string
 }
 
+// extractIssueID strips the external:prefix:id wrapper from bead IDs.
+// formatTrackBeadID() wraps cross-rig IDs as "external:prefix:id" for routing,
+// but consumers need the raw bead ID for display and lookups.
+func extractIssueID(id string) string {
+	if strings.HasPrefix(id, "external:") {
+		parts := strings.SplitN(id, ":", 3)
+		if len(parts) == 3 {
+			return parts[2]
+		}
+	}
+	return id
+}
+
 // getTrackedIssueStatus queries tracked issues and their status.
 func getTrackedIssueStatus(beadsDir, convoyID string) []trackedStatus {
 	if !convoyIDPattern.MatchString(convoyID) {
@@ -183,7 +196,7 @@ func getTrackedIssueStatus(beadsDir, convoyID string) []trackedStatus {
 
 	var tracked []trackedStatus
 	for _, dep := range deps {
-		tracked = append(tracked, trackedStatus{ID: dep.ID, Status: dep.Status})
+		tracked = append(tracked, trackedStatus{ID: extractIssueID(dep.ID), Status: dep.Status})
 	}
 
 	return tracked

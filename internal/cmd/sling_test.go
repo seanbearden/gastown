@@ -189,26 +189,8 @@ func TestFormatTrackBeadIDConsumerCompatibility(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			formatted := formatTrackBeadID(tt.beadID)
 
-			// Simulate consumer parsing logic
-			parsed := formatted
-			if len(formatted) > 9 && formatted[:9] == "external:" {
-				parts := make([]string, 0, 3)
-				start := 0
-				count := 0
-				for i := 0; i < len(formatted) && count < 2; i++ {
-					if formatted[i] == ':' {
-						parts = append(parts, formatted[start:i])
-						start = i + 1
-						count++
-					}
-				}
-				if count == 2 {
-					parts = append(parts, formatted[start:])
-				}
-				if len(parts) == 3 {
-					parsed = parts[2]
-				}
-			}
+			// Use the actual consumer function to verify round-trip
+			parsed := extractIssueID(formatted)
 
 			if parsed != tt.wantOriginalID {
 				t.Errorf("round-trip failed: formatTrackBeadID(%q) = %q, parsed back to %q, want %q",
