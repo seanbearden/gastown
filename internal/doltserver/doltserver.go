@@ -27,6 +27,7 @@
 package doltserver
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,8 +48,9 @@ import (
 
 // Default configuration
 const (
-	DefaultPort = 3307
-	DefaultUser = "root" // Default Dolt user (no password for local access)
+	DefaultPort           = 3307
+	DefaultUser           = "root" // Default Dolt user (no password for local access)
+	DefaultMaxConnections = 50     // Conservative default to prevent connection storms
 )
 
 // Config holds Dolt server configuration.
@@ -71,18 +73,24 @@ type Config struct {
 
 	// PidFile is the path to the PID file.
 	PidFile string
+
+	// MaxConnections is the maximum number of simultaneous connections the server will accept.
+	// Set to 0 to use the Dolt default (1000). Gas Town defaults to 50 to prevent
+	// connection storms during mass polecat slings.
+	MaxConnections int
 }
 
 // DefaultConfig returns the default Dolt server configuration.
 func DefaultConfig(townRoot string) *Config {
 	daemonDir := filepath.Join(townRoot, "daemon")
 	return &Config{
-		TownRoot: townRoot,
-		Port:     DefaultPort,
-		User:     DefaultUser,
-		DataDir:  filepath.Join(townRoot, ".dolt-data"),
-		LogFile:  filepath.Join(daemonDir, "dolt.log"),
-		PidFile:  filepath.Join(daemonDir, "dolt.pid"),
+		TownRoot:       townRoot,
+		Port:           DefaultPort,
+		User:           DefaultUser,
+		DataDir:        filepath.Join(townRoot, ".dolt-data"),
+		LogFile:        filepath.Join(daemonDir, "dolt.log"),
+		PidFile:        filepath.Join(daemonDir, "dolt.pid"),
+		MaxConnections: DefaultMaxConnections,
 	}
 }
 
@@ -358,10 +366,14 @@ func Start(townRoot string) error {
 	// Start dolt sql-server with --data-dir to serve all databases
 	// Note: --user flag is deprecated in newer Dolt; authentication is handled
 	// via privilege system. Default is root user with no password for localhost.
-	cmd := exec.Command("dolt", "sql-server",
+	args := []string{"sql-server",
 		"--port", strconv.Itoa(config.Port),
 		"--data-dir", config.DataDir,
-	)
+	}
+	if config.MaxConnections > 0 {
+		args = append(args, "--max-connections", strconv.Itoa(config.MaxConnections))
+	}
+	cmd := exec.Command("dolt", args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -724,7 +736,7 @@ func EnsureMetadata(townRoot, rigName string) error {
 		return fmt.Errorf("creating beads directory: %w", err)
 	}
 
-	if err := os.WriteFile(metadataPath, append(data, '\n'), 0600); err != nil {
+	if err := util.AtomicWriteFile(metadataPath, append(data, '\n'), 0600); err != nil {
 		return fmt.Errorf("writing metadata.json: %w", err)
 	}
 
@@ -776,6 +788,187 @@ func findRigBeadsDir(townRoot, rigName string) string {
 	return mayorBeads
 }
 
+// GetActiveConnectionCount queries the Dolt server to get the number of active connections.
+// Uses `dolt sql` to query information_schema.PROCESSLIST, which avoids needing
+// a MySQL driver dependency. Returns 0 if the server is unreachable or the query fails.
+func GetActiveConnectionCount(townRoot string) (int, error) {
+	config := DefaultConfig(townRoot)
+
+	// Use dolt sql-client to query the server with a timeout to prevent
+	// hanging indefinitely if the Dolt server is unresponsive.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx,
+		"dolt", "sql",
+		"-r", "csv",
+		"-q", "SELECT COUNT(*) AS cnt FROM information_schema.PROCESSLIST",
+	)
+	cmd.Dir = config.DataDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("querying connection count: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+
+	// Parse CSV output: "cnt\n5\n"
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) < 2 {
+		return 0, fmt.Errorf("unexpected output from connection count query: %s", string(output))
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(lines[len(lines)-1]))
+	if err != nil {
+		return 0, fmt.Errorf("parsing connection count %q: %w", lines[len(lines)-1], err)
+	}
+
+	return count, nil
+}
+
+// HasConnectionCapacity checks whether the Dolt server has capacity for new connections.
+// Returns true if the active connection count is below the threshold (80% of max_connections).
+// Returns true (optimistic) if the connection count cannot be determined.
+func HasConnectionCapacity(townRoot string) (bool, int, error) {
+	config := DefaultConfig(townRoot)
+	maxConn := config.MaxConnections
+	if maxConn <= 0 {
+		maxConn = 1000 // Dolt default
+	}
+
+	active, err := GetActiveConnectionCount(townRoot)
+	if err != nil {
+		// Optimistic: if we can't check, allow the spawn
+		return true, 0, err
+	}
+
+	// Use 80% threshold to leave headroom for existing operations
+	threshold := (maxConn * 80) / 100
+	if threshold < 1 {
+		threshold = 1
+	}
+
+	return active < threshold, active, nil
+}
+
+// HealthMetrics holds resource monitoring data for the Dolt server.
+type HealthMetrics struct {
+	// Connections is the number of active connections (from information_schema.PROCESSLIST).
+	Connections int `json:"connections"`
+
+	// MaxConnections is the configured maximum connections.
+	MaxConnections int `json:"max_connections"`
+
+	// ConnectionPct is the percentage of max connections in use.
+	ConnectionPct float64 `json:"connection_pct"`
+
+	// DiskUsageBytes is the total size of the .dolt-data/ directory.
+	DiskUsageBytes int64 `json:"disk_usage_bytes"`
+
+	// DiskUsageHuman is a human-readable disk usage string.
+	DiskUsageHuman string `json:"disk_usage_human"`
+
+	// QueryLatency is the time taken for a SELECT 1 round-trip.
+	QueryLatency time.Duration `json:"query_latency_ms"`
+
+	// Healthy indicates whether the server is within acceptable resource limits.
+	Healthy bool `json:"healthy"`
+
+	// Warnings contains any degradation warnings (non-fatal).
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// GetHealthMetrics collects resource monitoring metrics from the Dolt server.
+// Returns partial metrics if some checks fail — always returns what it can.
+func GetHealthMetrics(townRoot string) *HealthMetrics {
+	config := DefaultConfig(townRoot)
+	metrics := &HealthMetrics{
+		Healthy:        true,
+		MaxConnections: config.MaxConnections,
+	}
+	if metrics.MaxConnections <= 0 {
+		metrics.MaxConnections = 1000 // Dolt default
+	}
+
+	// 1. Query latency: time a SELECT 1
+	latency, err := MeasureQueryLatency(townRoot)
+	if err == nil {
+		metrics.QueryLatency = latency
+		if latency > 1*time.Second {
+			metrics.Warnings = append(metrics.Warnings,
+				fmt.Sprintf("query latency %v exceeds 1s threshold — server may be under stress", latency.Round(time.Millisecond)))
+		}
+	}
+
+	// 2. Connection count
+	connCount, err := GetActiveConnectionCount(townRoot)
+	if err == nil {
+		metrics.Connections = connCount
+		metrics.ConnectionPct = float64(connCount) / float64(metrics.MaxConnections) * 100
+		if metrics.ConnectionPct >= 80 {
+			metrics.Healthy = false
+			metrics.Warnings = append(metrics.Warnings,
+				fmt.Sprintf("connection count %d is %.0f%% of max %d — approaching limit",
+					connCount, metrics.ConnectionPct, metrics.MaxConnections))
+		}
+	}
+
+	// 3. Disk usage
+	diskBytes := dirSize(config.DataDir)
+	metrics.DiskUsageBytes = diskBytes
+	metrics.DiskUsageHuman = formatBytes(diskBytes)
+
+	return metrics
+}
+
+// MeasureQueryLatency times a SELECT 1 query against the Dolt server.
+func MeasureQueryLatency(townRoot string) (time.Duration, error) {
+	config := DefaultConfig(townRoot)
+
+	start := time.Now()
+	cmd := exec.Command("dolt", "sql", "-q", "SELECT 1")
+	cmd.Dir = config.DataDir
+	output, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		return 0, fmt.Errorf("SELECT 1 failed: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+
+	return elapsed, nil
+}
+
+// dirSize returns the total size of a directory tree in bytes.
+func dirSize(path string) int64 {
+	var total int64
+	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip errors
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// formatBytes returns a human-readable size string.
+func formatBytes(b int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+	switch {
+	case b >= GB:
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(GB))
+	case b >= MB:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(MB))
+	case b >= KB:
+		return fmt.Sprintf("%.1f KB", float64(b)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
 // moveDir moves a directory from src to dest. It first tries os.Rename for
 // efficiency, but falls back to copy+delete if src and dest are on different
 // filesystems (which causes EXDEV error on rename).
@@ -806,4 +999,67 @@ func moveDir(src, dest string) error {
 		return fmt.Errorf("removing source after copy: %w", err)
 	}
 	return nil
+}
+
+// doltSQL executes a SQL statement against a specific rig database on the Dolt server.
+// Uses the dolt CLI from the data directory (auto-detects running server).
+// The USE prefix selects the database since --use-db is not available on all dolt versions.
+func doltSQL(townRoot, rigDB, query string) error {
+	config := DefaultConfig(townRoot)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Prepend USE <db> to select the target database.
+	fullQuery := fmt.Sprintf("USE %s; %s", rigDB, query)
+	cmd := exec.CommandContext(ctx, "dolt", "sql", "-q", fullQuery)
+	cmd.Dir = config.DataDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// PolecatBranchName returns the Dolt branch name for a polecat.
+// Format: polecat-<name>-<unix-timestamp>
+func PolecatBranchName(polecatName string) string {
+	return fmt.Sprintf("polecat-%s-%d", strings.ToLower(polecatName), time.Now().Unix())
+}
+
+// CreatePolecatBranch creates a Dolt branch for a polecat's isolated writes.
+// Each polecat gets its own branch to eliminate optimistic lock contention.
+func CreatePolecatBranch(townRoot, rigDB, branchName string) error {
+	query := fmt.Sprintf("CALL DOLT_BRANCH('%s')", branchName)
+	if err := doltSQL(townRoot, rigDB, query); err != nil {
+		return fmt.Errorf("creating Dolt branch %s in %s: %w", branchName, rigDB, err)
+	}
+	return nil
+}
+
+// MergePolecatBranch merges a polecat's Dolt branch into main and deletes it.
+// Called at gt done time to make the polecat's beads changes visible.
+func MergePolecatBranch(townRoot, rigDB, branchName string) error {
+	// Checkout main, merge, delete branch — each as separate commands
+	// to avoid multi-statement parsing issues with dolt sql CLI.
+	if err := doltSQL(townRoot, rigDB, "CALL DOLT_CHECKOUT('main')"); err != nil {
+		return fmt.Errorf("checkout main in %s: %w", rigDB, err)
+	}
+	if err := doltSQL(townRoot, rigDB, fmt.Sprintf("CALL DOLT_MERGE('%s')", branchName)); err != nil {
+		return fmt.Errorf("merging %s to main in %s: %w", branchName, rigDB, err)
+	}
+	if err := doltSQL(townRoot, rigDB, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", branchName)); err != nil {
+		// Non-fatal: branch deletion failure doesn't lose data
+		fmt.Printf("Warning: could not delete Dolt branch %s: %v\n", branchName, err)
+	}
+	return nil
+}
+
+// DeletePolecatBranch deletes a polecat's Dolt branch (cleanup/nuke).
+// Best-effort: logs warning if branch doesn't exist or deletion fails.
+func DeletePolecatBranch(townRoot, rigDB, branchName string) {
+	query := fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s')", branchName)
+	if err := doltSQL(townRoot, rigDB, query); err != nil {
+		// Non-fatal: branch may not exist (already merged/deleted)
+		fmt.Printf("Warning: could not delete Dolt branch %s: %v\n", branchName, err)
+	}
 }

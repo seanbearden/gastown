@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExtractCommands(t *testing.T) {
@@ -148,6 +150,10 @@ func TestTruncateOutput(t *testing.T) {
 		{"hello world", 8, "hello..."},
 		{"hi", 2, "hi"},
 		{"abc", 3, "abc"},
+		// Bug fix: maxLen < 4 should not panic
+		{"hello", 3, "hel"},
+		{"hello", 2, "he"},
+		{"hello", 1, "h"},
 	}
 
 	for _, tt := range tests {
@@ -209,5 +215,445 @@ func TestMigrationCheckpointRoundTrip(t *testing.T) {
 	}
 	if loaded.Steps["backup"].Status != "pending" {
 		t.Errorf("backup status = %q, want pending", loaded.Steps["backup"].Status)
+	}
+}
+
+// =============================================================================
+// Checkpoint edge case tests
+// =============================================================================
+
+func TestLoadMigrationCheckpoint_InvalidJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Write corrupt checkpoint
+	cpPath := filepath.Join(tmpDir, migrationCheckpointFile)
+	if err := os.WriteFile(cpPath, []byte(`{corrupt json!!!`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadMigrationCheckpoint(tmpDir)
+	if err == nil {
+		t.Fatal("expected error for invalid JSON checkpoint, got nil")
+	}
+	if !strings.Contains(err.Error(), "parsing checkpoint") {
+		t.Errorf("expected 'parsing checkpoint' in error, got: %v", err)
+	}
+}
+
+func TestLoadMigrationCheckpoint_EmptyFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Write empty checkpoint
+	cpPath := filepath.Join(tmpDir, migrationCheckpointFile)
+	if err := os.WriteFile(cpPath, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadMigrationCheckpoint(tmpDir)
+	if err == nil {
+		t.Fatal("expected error for empty checkpoint, got nil")
+	}
+}
+
+func TestLoadMigrationCheckpoint_Nonexistent(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cp, err := loadMigrationCheckpoint(tmpDir)
+	if cp != nil {
+		t.Errorf("expected nil checkpoint, got %+v", cp)
+	}
+	if err == nil {
+		t.Fatal("expected error for nonexistent checkpoint, got nil")
+	}
+	if !os.IsNotExist(err) {
+		t.Errorf("expected os.IsNotExist error, got: %v", err)
+	}
+}
+
+func TestCheckpoint_RunningStatus(t *testing.T) {
+	// Simulates a crash mid-step: step has status "running"
+	tmpDir := t.TempDir()
+
+	cp := &MigrationCheckpoint{
+		FormulaVersion: 1,
+		TownRoot:       tmpDir,
+		StartedAt:      time.Now().Add(-10 * time.Minute),
+		UpdatedAt:      time.Now().Add(-5 * time.Minute),
+		Steps: map[string]StepRun{
+			"detect": {
+				ID:     "detect",
+				Status: "completed",
+			},
+			"backup": {
+				ID:        "backup",
+				Status:    "running",
+				StartedAt: time.Now().Add(-5 * time.Minute),
+			},
+			"migrate-rigs": {
+				ID:     "migrate-rigs",
+				Status: "pending",
+			},
+		},
+	}
+
+	if err := saveMigrationCheckpoint(tmpDir, cp); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	loaded, err := loadMigrationCheckpoint(tmpDir)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	// Verify the "running" step is preserved (so orchestrator can detect crash)
+	if loaded.Steps["backup"].Status != "running" {
+		t.Errorf("backup status = %q, want running", loaded.Steps["backup"].Status)
+	}
+}
+
+func TestCheckpoint_DifferentFormulaVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cp := &MigrationCheckpoint{
+		FormulaVersion: 99,
+		TownRoot:       tmpDir,
+		Steps: map[string]StepRun{
+			"old-step": {
+				ID:     "old-step",
+				Status: "completed",
+			},
+		},
+	}
+
+	if err := saveMigrationCheckpoint(tmpDir, cp); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	loaded, err := loadMigrationCheckpoint(tmpDir)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	if loaded.FormulaVersion != 99 {
+		t.Errorf("formula version = %d, want 99", loaded.FormulaVersion)
+	}
+}
+
+func TestCheckpoint_DifferentTownRoot(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cp := &MigrationCheckpoint{
+		FormulaVersion: 1,
+		TownRoot:       "/some/other/town",
+		Steps:          map[string]StepRun{},
+	}
+
+	if err := saveMigrationCheckpoint(tmpDir, cp); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	loaded, err := loadMigrationCheckpoint(tmpDir)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	// The checkpoint stores a different town root than where it's loaded from
+	// This is a detectable mismatch the orchestrator should catch
+	if loaded.TownRoot != "/some/other/town" {
+		t.Errorf("town root = %q, want /some/other/town", loaded.TownRoot)
+	}
+}
+
+func TestCheckpoint_AllStepsCompleted(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cp := &MigrationCheckpoint{
+		FormulaVersion: 1,
+		TownRoot:       tmpDir,
+		Steps: map[string]StepRun{
+			"detect":  {ID: "detect", Status: "completed"},
+			"backup":  {ID: "backup", Status: "completed"},
+			"migrate": {ID: "migrate", Status: "completed"},
+			"verify":  {ID: "verify", Status: "completed"},
+		},
+	}
+
+	if err := saveMigrationCheckpoint(tmpDir, cp); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	loaded, err := loadMigrationCheckpoint(tmpDir)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	completedCount := 0
+	for _, s := range loaded.Steps {
+		if s.Status == "completed" {
+			completedCount++
+		}
+	}
+	if completedCount != 4 {
+		t.Errorf("completed count = %d, want 4", completedCount)
+	}
+}
+
+func TestCheckpoint_FailedStep(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cp := &MigrationCheckpoint{
+		FormulaVersion: 1,
+		TownRoot:       tmpDir,
+		Steps: map[string]StepRun{
+			"detect": {ID: "detect", Status: "completed"},
+			"backup": {
+				ID:     "backup",
+				Status: "failed",
+				Error:  "disk full: /dev/sda1 is 100% full",
+			},
+		},
+	}
+
+	if err := saveMigrationCheckpoint(tmpDir, cp); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	loaded, err := loadMigrationCheckpoint(tmpDir)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	if loaded.Steps["backup"].Status != "failed" {
+		t.Errorf("backup status = %q, want failed", loaded.Steps["backup"].Status)
+	}
+	if loaded.Steps["backup"].Error != "disk full: /dev/sda1 is 100% full" {
+		t.Errorf("backup error = %q, want disk full message", loaded.Steps["backup"].Error)
+	}
+}
+
+func TestCheckpoint_LargeStepOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Simulate a step with large output
+	largeOutput := strings.Repeat("Migration log line\n", 1000)
+
+	cp := &MigrationCheckpoint{
+		FormulaVersion: 1,
+		TownRoot:       tmpDir,
+		Steps: map[string]StepRun{
+			"detect": {
+				ID:     "detect",
+				Status: "completed",
+				Output: largeOutput,
+			},
+		},
+	}
+
+	if err := saveMigrationCheckpoint(tmpDir, cp); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	loaded, err := loadMigrationCheckpoint(tmpDir)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	if loaded.Steps["detect"].Output != largeOutput {
+		t.Errorf("large output not preserved (got %d bytes, want %d)",
+			len(loaded.Steps["detect"].Output), len(largeOutput))
+	}
+}
+
+// =============================================================================
+// extractCommands edge case tests
+// =============================================================================
+
+func TestExtractCommands_UnclosedBlock(t *testing.T) {
+	// Unclosed code block should not produce commands
+	desc := "Start:\n\n```bash\ngt version\n"
+	commands := extractCommands(desc, "/tmp/gt")
+	if len(commands) != 0 {
+		t.Errorf("expected 0 commands from unclosed block, got %d: %v", len(commands), commands)
+	}
+}
+
+func TestExtractCommands_NestedCodeBlocks(t *testing.T) {
+	// Code block containing backtick-3 inside should not double-close
+	desc := "Run:\n\n```bash\necho '```'\necho done\n```\n"
+	commands := extractCommands(desc, "/tmp/gt")
+	// The inner ``` will be treated as closing the block
+	// This is a known limitation — documenting current behavior
+	if len(commands) == 0 {
+		t.Log("nested code blocks: inner ``` closed the block (expected)")
+	}
+}
+
+func TestExtractCommands_EmptyCodeBlock(t *testing.T) {
+	desc := "Run:\n\n```bash\n```\n"
+	commands := extractCommands(desc, "/tmp/gt")
+	if len(commands) != 0 {
+		t.Errorf("expected 0 commands from empty code block, got %d", len(commands))
+	}
+}
+
+func TestExtractCommands_WhitespaceOnlyBlock(t *testing.T) {
+	desc := "Run:\n\n```bash\n   \n  \n```\n"
+	commands := extractCommands(desc, "/tmp/gt")
+	if len(commands) != 0 {
+		t.Errorf("expected 0 commands from whitespace-only block, got %d", len(commands))
+	}
+}
+
+func TestExtractCommands_ShebangPreserved(t *testing.T) {
+	// Lines starting with #! should be preserved (shebangs)
+	desc := "Run:\n\n```bash\n#!/bin/bash\necho hello\n```\n"
+	commands := extractCommands(desc, "/tmp/gt")
+	if len(commands) != 1 {
+		t.Fatalf("expected 1 command, got %d", len(commands))
+	}
+	if !strings.Contains(commands[0], "#!/bin/bash") {
+		t.Errorf("shebang not preserved in command: %q", commands[0])
+	}
+}
+
+func TestExtractCommands_MultipleTemplateVars(t *testing.T) {
+	desc := "Run:\n\n```bash\ncp {{town_root}}/a {{town_root}}/b\n```\n"
+	commands := extractCommands(desc, "/my/town")
+	if len(commands) != 1 {
+		t.Fatalf("expected 1 command, got %d", len(commands))
+	}
+	if commands[0] != "cp /my/town/a /my/town/b" {
+		t.Errorf("template vars not replaced: %q", commands[0])
+	}
+}
+
+func TestExtractCommands_NonBashBlockIgnored(t *testing.T) {
+	// Python, yaml, etc. code blocks should be ignored
+	desc := "Config:\n\n```yaml\nkey: value\n```\n\n```python\nprint('hello')\n```\n"
+	commands := extractCommands(desc, "/tmp/gt")
+	if len(commands) != 0 {
+		t.Errorf("expected 0 commands from non-bash blocks, got %d: %v", len(commands), commands)
+	}
+}
+
+func TestExtractCommands_PathWithSpaces(t *testing.T) {
+	desc := "Run:\n\n```bash\nls {{town_root}}/my dir/\n```\n"
+	commands := extractCommands(desc, "/path with spaces")
+	if len(commands) != 1 {
+		t.Fatalf("expected 1 command, got %d", len(commands))
+	}
+	if commands[0] != "ls /path with spaces/my dir/" {
+		t.Errorf("path with spaces not handled: %q", commands[0])
+	}
+}
+
+// =============================================================================
+// truncateOutput edge case tests
+// =============================================================================
+
+func TestTruncateOutput_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name   string
+		s      string
+		maxLen int
+		want   string
+	}{
+		{"empty string", "", 10, ""},
+		{"exact length", "hello", 5, "hello"},
+		{"one over", "hello!", 5, "he..."},
+		{"maxLen equals 4", "hello", 4, "h..."},
+		{"very long string", strings.Repeat("x", 1000), 10, "xxxxxxx..."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateOutput(tt.s, tt.maxLen)
+			if got != tt.want {
+				t.Errorf("truncateOutput(%q, %d) = %q, want %q", tt.s, tt.maxLen, got, tt.want)
+			}
+		})
+	}
+}
+
+// =============================================================================
+// Checkpoint JSON serialization edge cases
+// =============================================================================
+
+func TestCheckpoint_PreservesTimestamps(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	now := time.Now().Truncate(time.Second)
+	cp := &MigrationCheckpoint{
+		FormulaVersion: 1,
+		TownRoot:       tmpDir,
+		StartedAt:      now,
+		Steps: map[string]StepRun{
+			"step1": {
+				ID:          "step1",
+				Status:      "completed",
+				StartedAt:   now.Add(-time.Minute),
+				CompletedAt: now,
+			},
+		},
+	}
+
+	if err := saveMigrationCheckpoint(tmpDir, cp); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	loaded, err := loadMigrationCheckpoint(tmpDir)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	// StartedAt should be preserved
+	if !loaded.StartedAt.Equal(now) {
+		t.Errorf("started_at = %v, want %v", loaded.StartedAt, now)
+	}
+	// UpdatedAt should be updated by save
+	if loaded.UpdatedAt.IsZero() {
+		t.Error("updated_at should not be zero after save")
+	}
+	// Step timestamps should be preserved
+	step := loaded.Steps["step1"]
+	if !step.StartedAt.Equal(now.Add(-time.Minute)) {
+		t.Errorf("step started_at = %v, want %v", step.StartedAt, now.Add(-time.Minute))
+	}
+	if !step.CompletedAt.Equal(now) {
+		t.Errorf("step completed_at = %v, want %v", step.CompletedAt, now)
+	}
+}
+
+func TestCheckpoint_JSONStructure(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cp := &MigrationCheckpoint{
+		FormulaVersion: 2,
+		TownRoot:       "/home/user/gt",
+		Steps: map[string]StepRun{
+			"detect": {ID: "detect", Status: "completed"},
+		},
+	}
+
+	if err := saveMigrationCheckpoint(tmpDir, cp); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	// Read raw JSON and verify structure
+	data, err := os.ReadFile(filepath.Join(tmpDir, migrationCheckpointFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("checkpoint is not valid JSON: %v", err)
+	}
+
+	// Verify required top-level fields
+	for _, field := range []string{"formula_version", "town_root", "started_at", "updated_at", "steps"} {
+		if _, ok := raw[field]; !ok {
+			t.Errorf("missing required field %q in checkpoint JSON", field)
+		}
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -203,7 +204,9 @@ func loadMigrationCheckpoint(townRoot string) (*MigrationCheckpoint, error) {
 	return &cp, nil
 }
 
-// saveMigrationCheckpoint persists the checkpoint to disk.
+// saveMigrationCheckpoint persists the checkpoint to disk atomically.
+// Uses atomic write (temp file + rename) to prevent corruption if the
+// process crashes mid-write, which would break checkpoint-based recovery.
 func saveMigrationCheckpoint(townRoot string, cp *MigrationCheckpoint) error {
 	cp.UpdatedAt = time.Now()
 	data, err := json.MarshalIndent(cp, "", "  ")
@@ -212,7 +215,7 @@ func saveMigrationCheckpoint(townRoot string, cp *MigrationCheckpoint) error {
 	}
 
 	path := filepath.Join(townRoot, migrationCheckpointFile)
-	return os.WriteFile(path, data, 0600)
+	return util.AtomicWriteFile(path, data, 0600)
 }
 
 // dryRunMigration shows what would be executed.
@@ -460,6 +463,9 @@ func isCommentOnly(block string) bool {
 func truncateOutput(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
+	}
+	if maxLen < 4 {
+		return s[:maxLen]
 	}
 	return s[:maxLen-3] + "..."
 }

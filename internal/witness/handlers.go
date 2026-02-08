@@ -208,17 +208,17 @@ func HandleHelp(workDir, rigName string, msg *mail.Message, router *mail.Router)
 		return result
 	}
 
-	// Need to escalate to Mayor
+	// Need to escalate to Deacon (first line of escalation for routine ops)
 	if assessment.NeedsEscalation {
-		mailID, err := escalateToMayor(router, rigName, payload, assessment.EscalationReason)
+		mailID, err := escalateToDeacon(router, rigName, payload, assessment.EscalationReason)
 		if err != nil {
-			result.Error = fmt.Errorf("escalating to mayor: %w", err)
+			result.Error = fmt.Errorf("escalating to deacon: %w", err)
 			return result
 		}
 
 		result.Handled = true
 		result.MailSent = mailID
-		result.Action = fmt.Sprintf("escalated '%s' to mayor: %s", payload.Topic, assessment.EscalationReason)
+		result.Action = fmt.Sprintf("escalated '%s' to deacon: %s", payload.Topic, assessment.EscalationReason)
 	}
 
 	return result
@@ -503,16 +503,15 @@ func findCleanupWisp(workDir, polecatName string) (string, error) {
 		return "", nil
 	}
 
-	// Simple extraction - look for "id" field
-	// Full JSON parsing would add dependency on encoding/json
-	if idx := strings.Index(output, `"id":`); idx >= 0 {
-		rest := output[idx+5:]
-		rest = strings.TrimLeft(rest, ` "`)
-		if endIdx := strings.IndexAny(rest, `",}`); endIdx > 0 {
-			return rest[:endIdx], nil
-		}
+	var items []struct {
+		ID string `json:"id"`
 	}
-
+	if err := json.Unmarshal([]byte(output), &items); err != nil {
+		return "", fmt.Errorf("parsing cleanup wisp response: %w", err)
+	}
+	if len(items) > 0 {
+		return items[0].ID, nil
+	}
 	return "", nil
 }
 
@@ -548,15 +547,15 @@ func getCleanupStatus(workDir, rigName, polecatName string) string {
 		return ""
 	}
 
-	// Parse the JSON response
-	var resp agentBeadResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
+	// Parse the JSON response — bd show --json returns an array
+	var issues []agentBeadResponse
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
 		return ""
 	}
 
 	// Parse cleanup_status from description
 	// Description format has "cleanup_status: <value>" line
-	for _, line := range strings.Split(resp.Description, "\n") {
+	for _, line := range strings.Split(issues[0].Description, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(strings.ToLower(line), "cleanup_status:") {
 			value := strings.TrimSpace(strings.TrimPrefix(line, "cleanup_status:"))
@@ -570,11 +569,13 @@ func getCleanupStatus(workDir, rigName, polecatName string) string {
 	return ""
 }
 
-// escalateToMayor sends an escalation mail to the Mayor.
-func escalateToMayor(router *mail.Router, rigName string, payload *HelpPayload, reason string) (string, error) {
+// escalateToDeacon sends an escalation mail to the Deacon for routine operational issues.
+// The Deacon is the first line of escalation for witness operations. Only truly strategic
+// issues (deacon down, cross-rig coordination) should go directly to Mayor.
+func escalateToDeacon(router *mail.Router, rigName string, payload *HelpPayload, reason string) (string, error) {
 	msg := &mail.Message{
 		From:     fmt.Sprintf("%s/witness", rigName),
-		To:       "mayor/",
+		To:       "deacon/",
 		Subject:  fmt.Sprintf("Escalation: %s needs help", payload.Agent),
 		Priority: mail.PriorityHigh,
 		Body: fmt.Sprintf(`Agent: %s
@@ -611,14 +612,15 @@ type RecoveryPayload struct {
 	DetectedAt    time.Time
 }
 
-// EscalateRecoveryNeeded sends a RECOVERY_NEEDED escalation to the Mayor.
+// EscalateRecoveryNeeded sends a RECOVERY_NEEDED escalation to the Deacon.
 // This is used when a dormant polecat has unpushed work that needs recovery
-// before cleanup. The Mayor should coordinate recovery (e.g., push the branch,
-// save the work) before authorizing cleanup.
+// before cleanup. The Deacon should coordinate recovery (e.g., push the branch,
+// save the work) before authorizing cleanup. Only escalates to Mayor if Deacon
+// cannot resolve.
 func EscalateRecoveryNeeded(router *mail.Router, rigName string, payload *RecoveryPayload) (string, error) {
 	msg := &mail.Message{
 		From:     fmt.Sprintf("%s/witness", rigName),
-		To:       "mayor/",
+		To:       "deacon/",
 		Subject:  fmt.Sprintf("RECOVERY_NEEDED %s/%s", rigName, payload.PolecatName),
 		Priority: mail.PriorityUrgent,
 		Body: fmt.Sprintf(`Polecat: %s/%s
@@ -844,4 +846,178 @@ func verifyCommitOnMain(workDir, rigName, polecatName string) (bool, error) {
 
 	// Commit is not on any remote's default branch
 	return false, nil
+}
+
+// ZombieResult describes a detected zombie polecat and the action taken.
+type ZombieResult struct {
+	PolecatName string
+	AgentState  string
+	HookBead    string
+	Action      string // "auto-nuked", "escalated", "cleanup-wisp-created"
+	Error       error
+}
+
+// DetectZombiePolecatsResult contains the results of a zombie detection sweep.
+type DetectZombiePolecatsResult struct {
+	Checked int
+	Zombies []ZombieResult
+}
+
+// DetectZombiePolecats cross-references polecat agent state with tmux session
+// existence to find zombie polecats. A zombie is a polecat whose tmux session
+// is dead but whose agent bead still shows agent_state="working" or has a
+// hook_bead assigned.
+//
+// Zombies cannot send POLECAT_DONE or other signals, so they sit undetected
+// by the reactive signal-based patrol. This function provides proactive detection.
+//
+// For each zombie found:
+//   - If git state is clean (no unpushed work): auto-nuke
+//   - If git state is dirty (unpushed/uncommitted work): escalate to Mayor via
+//     EscalateRecoveryNeeded, create cleanup wisp
+func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZombiePolecatsResult {
+	result := &DetectZombiePolecatsResult{}
+
+	// Find town root for beads prefix resolution
+	townRoot, err := workspace.Find(workDir)
+	if err != nil || townRoot == "" {
+		townRoot = workDir
+	}
+
+	// List all polecat directories
+	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
+	entries, err := os.ReadDir(polecatsDir)
+	if err != nil {
+		return result // No polecats directory
+	}
+
+	t := tmux.NewTmux()
+
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		polecatName := entry.Name()
+		sessionName := fmt.Sprintf("gt-%s-%s", rigName, polecatName)
+		result.Checked++
+
+		// Check if tmux session exists
+		sessionAlive, err := t.HasSession(sessionName)
+		if err != nil || sessionAlive {
+			continue // Session exists or error checking — not a zombie
+		}
+
+		// Session is dead. Check agent bead state.
+		prefix := beads.GetPrefixForRig(townRoot, rigName)
+		agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
+
+		agentState, hookBead := getAgentBeadState(workDir, agentBeadID)
+
+		// A zombie has a dead session but agent_state suggests it should be alive,
+		// or it still has work hooked.
+		isZombie := false
+		if hookBead != "" {
+			isZombie = true
+		}
+		if agentState == "working" || agentState == "running" {
+			isZombie = true
+		}
+
+		if !isZombie {
+			continue
+		}
+
+		// Zombie detected! Determine cleanup action based on git state.
+		zombie := ZombieResult{
+			PolecatName: polecatName,
+			AgentState:  agentState,
+			HookBead:    hookBead,
+		}
+
+		cleanupStatus := getCleanupStatus(workDir, rigName, polecatName)
+
+		switch cleanupStatus {
+		case "clean":
+			// Polecat ran gt done and confirmed clean state — safe to auto-nuke.
+			nukeResult := AutoNukeIfClean(workDir, rigName, polecatName)
+			if nukeResult.Nuked {
+				zombie.Action = "auto-nuked"
+			} else if nukeResult.Skipped {
+				wispID, wispErr := createCleanupWisp(workDir, polecatName, hookBead, "")
+				if wispErr != nil {
+					zombie.Error = wispErr
+				}
+				zombie.Action = fmt.Sprintf("cleanup-wisp-created:%s (skip reason: %s)", wispID, nukeResult.Reason)
+			} else if nukeResult.Error != nil {
+				zombie.Error = nukeResult.Error
+				zombie.Action = "nuke-failed"
+			}
+
+		case "":
+			// Empty cleanup_status means the agent bead has no cleanup info —
+			// the polecat likely crashed before running gt done. AutoNukeIfClean
+			// handles this via verifyCommitOnMain fallback: only nukes if the
+			// polecat's commit is already on main, otherwise skips.
+			nukeResult := AutoNukeIfClean(workDir, rigName, polecatName)
+			if nukeResult.Nuked {
+				zombie.Action = "auto-nuked"
+			} else if nukeResult.Skipped {
+				// Couldn't nuke cleanly — create cleanup wisp
+				wispID, wispErr := createCleanupWisp(workDir, polecatName, hookBead, "")
+				if wispErr != nil {
+					zombie.Error = wispErr
+				}
+				zombie.Action = fmt.Sprintf("cleanup-wisp-created:%s (skip reason: %s)", wispID, nukeResult.Reason)
+			} else if nukeResult.Error != nil {
+				zombie.Error = nukeResult.Error
+				zombie.Action = "nuke-failed"
+			}
+
+		case "has_uncommitted", "has_stash", "has_unpushed":
+			// Dirty state — escalate to Mayor for recovery
+			if router != nil {
+				_, escErr := EscalateRecoveryNeeded(router, rigName, &RecoveryPayload{
+					PolecatName:   polecatName,
+					Rig:           rigName,
+					CleanupStatus: cleanupStatus,
+					IssueID:       hookBead,
+					DetectedAt:    time.Now(),
+				})
+				if escErr != nil {
+					zombie.Error = escErr
+				}
+			}
+			// Also create cleanup wisp for tracking
+			wispID, wispErr := createCleanupWisp(workDir, polecatName, hookBead, "")
+			if wispErr != nil && zombie.Error == nil {
+				zombie.Error = wispErr
+			}
+			zombie.Action = fmt.Sprintf("escalated (cleanup_status=%s, wisp=%s)", cleanupStatus, wispID)
+		}
+
+		result.Zombies = append(result.Zombies, zombie)
+	}
+
+	return result
+}
+
+// getAgentBeadState reads agent_state and hook_bead from an agent bead.
+// Returns the agent_state string and hook_bead ID.
+func getAgentBeadState(workDir, agentBeadID string) (agentState, hookBead string) {
+	output, err := util.ExecWithOutput(workDir, "bd", "show", agentBeadID, "--json")
+	if err != nil || output == "" {
+		return "", ""
+	}
+
+	// Parse JSON response — bd show --json returns an array
+	var issues []struct {
+		AgentState string `json:"agent_state"`
+		HookBead   string `json:"hook_bead"`
+	}
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
+		return "", ""
+	}
+
+	return issues[0].AgentState, issues[0].HookBead
 }

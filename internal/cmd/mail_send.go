@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -16,6 +17,18 @@ import (
 )
 
 func runMailSend(cmd *cobra.Command, args []string) error {
+	// Handle --stdin: read message body from stdin (avoids shell quoting issues)
+	if mailStdin {
+		if mailBody != "" {
+			return fmt.Errorf("cannot use --stdin with --message/-m")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("reading stdin: %w", err)
+		}
+		mailBody = strings.TrimRight(string(data), "\n")
+	}
+
 	var to string
 
 	if mailSendSelf {

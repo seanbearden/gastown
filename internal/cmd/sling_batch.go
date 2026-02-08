@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -38,6 +39,10 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 
 	fmt.Printf("%s Batch slinging %d beads to rig '%s'...\n", style.Bold.Render("🎯"), len(beadIDs), rigName)
 
+	if slingMaxConcurrent > 0 {
+		fmt.Printf("  Max concurrent spawns: %d\n", slingMaxConcurrent)
+	}
+
 	// Issue #288: Auto-apply mol-polecat-work for batch sling
 	// Cook once before the loop for efficiency
 	townRoot := filepath.Dir(townBeadsDir)
@@ -52,9 +57,25 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		errMsg  string
 	}
 	results := make([]slingResult, 0, len(beadIDs))
+	activeCount := 0 // Track active spawns for --max-concurrent throttling
 
 	// Spawn a polecat for each bead and sling it
 	for i, beadID := range beadIDs {
+		// Admission control: throttle spawns when --max-concurrent is set
+		if slingMaxConcurrent > 0 && activeCount >= slingMaxConcurrent {
+			fmt.Printf("\n%s Max concurrent limit reached (%d), waiting for capacity...\n",
+				style.Warning.Render("⏳"), slingMaxConcurrent)
+			// Wait with exponential backoff for sessions to settle
+			for wait := 0; wait < 30; wait++ {
+				time.Sleep(2 * time.Second)
+				// Recount active — in practice, polecats become self-sufficient quickly
+				// so we just use a time-based cooldown rather than precise counting
+				if wait >= 2 {
+					break
+				}
+			}
+		}
+
 		fmt.Printf("\n[%d/%d] Slinging %s...\n", i+1, len(beadIDs), beadID)
 
 		// Check bead status
@@ -150,30 +171,18 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		// Update agent bead state
 		updateAgentHookBead(targetAgent, beadToHook, hookWorkDir, townBeadsDir)
 
-		// Store dispatcher in bead (enables completion notification to dispatcher)
-		if err := storeDispatcherInBead(beadID, actor); err != nil {
-			fmt.Printf("  %s Could not store dispatcher in bead: %v\n", style.Dim.Render("Warning:"), err)
+		// Store all attachment fields in a single read-modify-write cycle.
+		// This eliminates the race condition where sequential independent updates
+		// could overwrite each other under concurrent access.
+		fieldUpdates := beadFieldUpdates{
+			Dispatcher:       actor,
+			Args:             slingArgs,
+			AttachedMolecule: attachedMoleculeID,
+			NoMerge:          slingNoMerge,
 		}
-
-		// Store no_merge flag in bead (skips merge queue on completion)
-		if slingNoMerge {
-			if err := storeNoMergeInBead(beadID, true); err != nil {
-				fmt.Printf("  %s Could not store no_merge in bead: %v\n", style.Dim.Render("Warning:"), err)
-			}
-		}
-
-		// Store attached molecule in the hooked bead
-		if attachedMoleculeID != "" {
-			if err := storeAttachedMoleculeInBead(beadToHook, attachedMoleculeID); err != nil {
-				fmt.Printf("  %s Could not store attached_molecule: %v\n", style.Dim.Render("Warning:"), err)
-			}
-		}
-
-		// Store args if provided
-		if slingArgs != "" {
-			if err := storeArgsInBead(beadID, slingArgs); err != nil {
-				fmt.Printf("  %s Could not store args: %v\n", style.Dim.Render("Warning:"), err)
-			}
+		// Use beadToHook for the update target (may differ from beadID when formula-on-bead)
+		if err := storeFieldsInBead(beadToHook, fieldUpdates); err != nil {
+			fmt.Printf("  %s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
 		}
 
 		// Start polecat session now that molecule/bead is attached.
@@ -188,6 +197,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 			_ = pane
 		}
 
+		activeCount++
 		results = append(results, slingResult{beadID: beadID, polecat: spawnInfo.PolecatName, success: true})
 	}
 

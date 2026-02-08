@@ -96,8 +96,11 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 		defer func() {
 			_ = lock.Unlock()
-			// Clean up lock file after releasing (defense in depth)
-			_ = os.Remove(filepath.Join(townRoot, shutdownLockFile))
+			// Do NOT remove the lock file. Flock works on file descriptors,
+			// not paths. Removing the file while another process is waiting
+			// on the flock causes it to acquire a lock on the deleted inode,
+			// providing no mutual exclusion against a process that creates a
+			// new file at the same path.
 		}()
 
 		// Prevent tmux server from exiting when all sessions are killed.

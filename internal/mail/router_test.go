@@ -71,6 +71,7 @@ func TestIsTownLevelAddress(t *testing.T) {
 		{"mayor/", true},
 		{"deacon", true},
 		{"deacon/", true},
+		{"overseer", true},
 		{"gastown/refinery", false},
 		{"gastown/polecats/Toast", false},
 		{"gastown/", false},
@@ -92,6 +93,9 @@ func TestAddressToSessionIDs(t *testing.T) {
 		address string
 		want    []string
 	}{
+		// Overseer (human operator) - single session
+		{"overseer", []string{"hq-overseer"}},
+
 		// Town-level addresses - single session
 		{"mayor", []string{"hq-mayor"}},
 		{"mayor/", []string{"hq-mayor"}},
@@ -137,6 +141,7 @@ func TestAddressToSessionID(t *testing.T) {
 		address string
 		want    string
 	}{
+		{"overseer", "hq-overseer"},
 		{"mayor", "hq-mayor"},
 		{"mayor/", "hq-mayor"},
 		{"deacon", "hq-deacon"},

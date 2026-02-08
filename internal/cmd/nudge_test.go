@@ -1,9 +1,32 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestNudgeStdinConflict(t *testing.T) {
+	// Save and restore package-level flags
+	origMessage := nudgeMessageFlag
+	origStdin := nudgeStdinFlag
+	defer func() {
+		nudgeMessageFlag = origMessage
+		nudgeStdinFlag = origStdin
+	}()
+
+	// When both --stdin and --message are set, runNudge should return an error
+	nudgeStdinFlag = true
+	nudgeMessageFlag = "some message"
+
+	err := runNudge(nudgeCmd, []string{"gastown/alpha"})
+	if err == nil {
+		t.Fatal("expected error when --stdin and --message are both set")
+	}
+	if !strings.Contains(err.Error(), "cannot use --stdin with --message/-m") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
 
 func TestResolveNudgePattern(t *testing.T) {
 	// Create test agent sessions (mayor/deacon use hq- prefix)

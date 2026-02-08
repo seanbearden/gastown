@@ -8,6 +8,120 @@ import (
 	"testing"
 )
 
+// =============================================================================
+// Health metrics tests
+// =============================================================================
+
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		input int64
+		want  string
+	}{
+		{0, "0 B"},
+		{500, "500 B"},
+		{1024, "1.0 KB"},
+		{1536, "1.5 KB"},
+		{1048576, "1.0 MB"},
+		{1572864, "1.5 MB"},
+		{1073741824, "1.0 GB"},
+		{2147483648, "2.0 GB"},
+	}
+	for _, tt := range tests {
+		got := formatBytes(tt.input)
+		if got != tt.want {
+			t.Errorf("formatBytes(%d) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestDirSize(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create some files with known sizes
+	if err := os.WriteFile(filepath.Join(tmpDir, "a.txt"), make([]byte, 100), 0644); err != nil {
+		t.Fatal(err)
+	}
+	subDir := filepath.Join(tmpDir, "sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, "b.txt"), make([]byte, 200), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	size := dirSize(tmpDir)
+	if size != 300 {
+		t.Errorf("dirSize = %d, want 300", size)
+	}
+}
+
+func TestDirSize_EmptyDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	size := dirSize(tmpDir)
+	if size != 0 {
+		t.Errorf("dirSize of empty dir = %d, want 0", size)
+	}
+}
+
+func TestDirSize_NonexistentDir(t *testing.T) {
+	size := dirSize("/nonexistent/path/that/does/not/exist")
+	if size != 0 {
+		t.Errorf("dirSize of nonexistent dir = %d, want 0", size)
+	}
+}
+
+func TestGetHealthMetrics_NoServer(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Create .dolt-data dir with some content
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "testfile"), make([]byte, 1024), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	metrics := GetHealthMetrics(townRoot)
+
+	// Connections and latency depend on whether a local Dolt server is running.
+	// With no server, both are 0. With a server, dolt auto-detects it.
+	// Either outcome is valid for this test — the key assertion is that
+	// GetHealthMetrics doesn't panic or hang.
+	if metrics.Connections < 0 {
+		t.Errorf("Connections = %d, want >= 0", metrics.Connections)
+	}
+	if metrics.QueryLatency < 0 {
+		t.Errorf("QueryLatency = %v, want >= 0", metrics.QueryLatency)
+	}
+
+	// Disk usage should reflect our test file
+	if metrics.DiskUsageBytes < 1024 {
+		t.Errorf("DiskUsageBytes = %d, want >= 1024", metrics.DiskUsageBytes)
+	}
+	if metrics.DiskUsageHuman == "" {
+		t.Error("DiskUsageHuman should not be empty")
+	}
+
+	// MaxConnections should have a default
+	if metrics.MaxConnections <= 0 {
+		t.Errorf("MaxConnections = %d, want > 0", metrics.MaxConnections)
+	}
+}
+
+func TestGetHealthMetrics_EmptyDataDir(t *testing.T) {
+	townRoot := t.TempDir()
+
+	metrics := GetHealthMetrics(townRoot)
+
+	if metrics.DiskUsageBytes != 0 {
+		t.Errorf("DiskUsageBytes = %d, want 0 (no data dir)", metrics.DiskUsageBytes)
+	}
+	if metrics.DiskUsageHuman != "0 B" {
+		t.Errorf("DiskUsageHuman = %q, want %q", metrics.DiskUsageHuman, "0 B")
+	}
+}
+
 func TestFindMigratableDatabases_FollowsRedirect(t *testing.T) {
 	// Setup: simulate a town with a rig that uses a redirect
 	townRoot := t.TempDir()
@@ -1093,6 +1207,44 @@ func TestMigrateRigFromBeads_IdempotentDetection(t *testing.T) {
 
 // TestFindAndMigrateAll_Idempotent tests the full find-then-migrate workflow
 // twice: first run migrates, second run finds nothing to do.
+// =============================================================================
+// Max connections and admission control tests
+// =============================================================================
+
+func TestDefaultConfig_MaxConnections(t *testing.T) {
+	townRoot := t.TempDir()
+	config := DefaultConfig(townRoot)
+
+	if config.MaxConnections != DefaultMaxConnections {
+		t.Errorf("MaxConnections = %d, want %d", config.MaxConnections, DefaultMaxConnections)
+	}
+	if config.MaxConnections != 50 {
+		t.Errorf("DefaultMaxConnections = %d, want 50", config.MaxConnections)
+	}
+}
+
+func TestHasConnectionCapacity_ZeroMax(t *testing.T) {
+	// When MaxConnections is 0, the function should use Dolt default (1000).
+	// Since we can't connect to a real server in unit tests, we just verify
+	// the function doesn't panic and returns an error (no server).
+	townRoot := t.TempDir()
+
+	// Create minimal config structure
+	daemonDir := filepath.Join(townRoot, "daemon")
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// HasConnectionCapacity should return true (optimistic) when query fails
+	hasCapacity, _, err := HasConnectionCapacity(townRoot)
+	if err == nil {
+		t.Skip("Dolt server is actually running, cannot test offline case")
+	}
+	if !hasCapacity {
+		t.Error("expected optimistic true when server is unreachable")
+	}
+}
+
 func TestFindAndMigrateAll_Idempotent(t *testing.T) {
 	townRoot := t.TempDir()
 
@@ -1169,5 +1321,413 @@ func TestFindAndMigrateAll_Idempotent(t *testing.T) {
 		if meta["backend"] != "dolt" {
 			t.Errorf("%s: backend = %v, want dolt", rig, meta["backend"])
 		}
+	}
+}
+
+// =============================================================================
+// Additional rollback edge case tests (main rollback tests are in rollback_test.go)
+// =============================================================================
+
+func TestRestoreFromBackup_BackupIsFile(t *testing.T) {
+	townRoot := t.TempDir()
+
+	filePath := filepath.Join(townRoot, "not-a-dir")
+	if err := os.WriteFile(filePath, []byte("not a backup"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := RestoreFromBackup(townRoot, filePath)
+	if err == nil {
+		t.Fatal("expected error when backup path is a file, got nil")
+	}
+}
+
+func TestRestoreFromBackup_EmptyBackup(t *testing.T) {
+	townRoot := t.TempDir()
+
+	backupDir := filepath.Join(townRoot, "migration-backup-20240115-143022")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := RestoreFromBackup(townRoot, backupDir)
+	if err != nil {
+		t.Fatalf("RestoreFromBackup failed: %v", err)
+	}
+	if result.RestoredTown {
+		t.Error("expected no town restoration from empty backup")
+	}
+	if len(result.RestoredRigs) != 0 {
+		t.Errorf("expected 0 restored rigs, got %d", len(result.RestoredRigs))
+	}
+}
+
+// =============================================================================
+// Metadata edge cases
+// =============================================================================
+
+func TestEnsureMetadata_CreatesBeadsDir(t *testing.T) {
+	townRoot := t.TempDir()
+
+	if err := EnsureMetadata(townRoot, "hq"); err != nil {
+		t.Fatalf("EnsureMetadata failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(townRoot, ".beads", "metadata.json"))
+	if err != nil {
+		t.Fatalf("reading metadata: %v", err)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("parsing metadata: %v", err)
+	}
+	if meta["backend"] != "dolt" {
+		t.Errorf("backend = %v, want dolt", meta["backend"])
+	}
+}
+
+func TestEnsureMetadata_PreservesJSONLExport(t *testing.T) {
+	townRoot := t.TempDir()
+
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	existing := map[string]interface{}{"jsonl_export": "custom-issues.jsonl"}
+	data, _ := json.Marshal(existing)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureMetadata(townRoot, "hq"); err != nil {
+		t.Fatalf("EnsureMetadata failed: %v", err)
+	}
+
+	updated, _ := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	var meta map[string]interface{}
+	json.Unmarshal(updated, &meta)
+	if meta["jsonl_export"] != "custom-issues.jsonl" {
+		t.Errorf("jsonl_export = %v, want custom-issues.jsonl", meta["jsonl_export"])
+	}
+}
+
+func TestEnsureMetadata_SetsDefaultJSONLExport(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureMetadata(townRoot, "hq"); err != nil {
+		t.Fatalf("EnsureMetadata failed: %v", err)
+	}
+
+	data, _ := os.ReadFile(filepath.Join(townRoot, ".beads", "metadata.json"))
+	var meta map[string]interface{}
+	json.Unmarshal(data, &meta)
+	if meta["jsonl_export"] != "issues.jsonl" {
+		t.Errorf("jsonl_export = %v, want issues.jsonl", meta["jsonl_export"])
+	}
+}
+
+// =============================================================================
+// InitRig validation tests
+// =============================================================================
+
+func TestInitRig_EmptyName(t *testing.T) {
+	townRoot := t.TempDir()
+	err := InitRig(townRoot, "")
+	if err == nil {
+		t.Fatal("expected error for empty rig name")
+	}
+}
+
+func TestInitRig_InvalidCharacters(t *testing.T) {
+	townRoot := t.TempDir()
+	for _, name := range []string{"my rig", "rig/name", "rig.name", "rig@name"} {
+		err := InitRig(townRoot, name)
+		if err == nil {
+			t.Errorf("expected error for invalid rig name %q", name)
+		}
+	}
+}
+
+// =============================================================================
+// ListDatabases edge cases
+// =============================================================================
+
+func TestListDatabases_EmptyDataDir(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	databases, err := ListDatabases(townRoot)
+	if err != nil {
+		t.Fatalf("ListDatabases failed: %v", err)
+	}
+	if len(databases) != 0 {
+		t.Errorf("expected 0 databases, got %d", len(databases))
+	}
+}
+
+func TestListDatabases_NoDataDir(t *testing.T) {
+	townRoot := t.TempDir()
+	databases, err := ListDatabases(townRoot)
+	if err != nil {
+		t.Fatalf("ListDatabases failed: %v", err)
+	}
+	if databases != nil {
+		t.Errorf("expected nil, got %v", databases)
+	}
+}
+
+func TestListDatabases_MixedContent(t *testing.T) {
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+
+	if err := os.MkdirAll(filepath.Join(dataDir, "hq", ".dolt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "not-a-db"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "somefile.txt"), []byte("hi"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "myrig", ".dolt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	databases, err := ListDatabases(townRoot)
+	if err != nil {
+		t.Fatalf("ListDatabases failed: %v", err)
+	}
+	if len(databases) != 2 {
+		t.Errorf("expected 2 databases, got %d: %v", len(databases), databases)
+	}
+}
+
+// =============================================================================
+// Connection string tests
+// =============================================================================
+
+func TestGetConnectionString(t *testing.T) {
+	townRoot := t.TempDir()
+	s := GetConnectionString(townRoot)
+	if s != "root@tcp(127.0.0.1:3307)/" {
+		t.Errorf("got %q, want root@tcp(127.0.0.1:3307)/", s)
+	}
+}
+
+func TestGetConnectionStringForRig(t *testing.T) {
+	townRoot := t.TempDir()
+	s := GetConnectionStringForRig(townRoot, "hq")
+	if s != "root@tcp(127.0.0.1:3307)/hq" {
+		t.Errorf("got %q, want root@tcp(127.0.0.1:3307)/hq", s)
+	}
+}
+
+// =============================================================================
+// State tests
+// =============================================================================
+
+func TestSaveAndLoadState(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "daemon"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &State{
+		Running:   true,
+		PID:       12345,
+		Port:      3307,
+		DataDir:   filepath.Join(townRoot, ".dolt-data"),
+		Databases: []string{"hq", "myrig"},
+	}
+
+	if err := SaveState(townRoot, state); err != nil {
+		t.Fatalf("SaveState failed: %v", err)
+	}
+
+	loaded, err := LoadState(townRoot)
+	if err != nil {
+		t.Fatalf("LoadState failed: %v", err)
+	}
+	if !loaded.Running {
+		t.Error("Running should be true")
+	}
+	if loaded.PID != 12345 {
+		t.Errorf("PID = %d, want 12345", loaded.PID)
+	}
+	if len(loaded.Databases) != 2 {
+		t.Errorf("expected 2 databases, got %d", len(loaded.Databases))
+	}
+}
+
+func TestLoadState_NoFile(t *testing.T) {
+	townRoot := t.TempDir()
+	state, err := LoadState(townRoot)
+	if err != nil {
+		t.Fatalf("LoadState with no file: %v", err)
+	}
+	if state == nil {
+		t.Fatal("expected empty state, not nil")
+	}
+	if state.Running {
+		t.Error("empty state should not be running")
+	}
+}
+
+func TestLoadState_CorruptJSON(t *testing.T) {
+	townRoot := t.TempDir()
+	stateFile := StateFile(townRoot)
+	if err := os.MkdirAll(filepath.Dir(stateFile), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile, []byte(`{corrupt`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadState(townRoot)
+	if err == nil {
+		t.Fatal("expected error for corrupt state file")
+	}
+}
+
+// =============================================================================
+// Rollback round-trip test
+// =============================================================================
+
+func TestRollbackRoundTrip(t *testing.T) {
+	townRoot := t.TempDir()
+
+	rigName := "roundtrip"
+	originalBeads := filepath.Join(townRoot, rigName, ".beads")
+	if err := os.MkdirAll(originalBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(originalBeads, "metadata.json"),
+		[]byte(`{"backend":"sqlite"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(originalBeads, "beads.db"),
+		[]byte("original-data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create backup
+	backupDir := filepath.Join(townRoot, "migration-backup-20240115-143022")
+	rigBackup := filepath.Join(backupDir, rigName+"-beads")
+	if err := os.MkdirAll(rigBackup, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"metadata.json", "beads.db"} {
+		data, _ := os.ReadFile(filepath.Join(originalBeads, f))
+		os.WriteFile(filepath.Join(rigBackup, f), data, 0644)
+	}
+
+	// Simulate migration
+	os.WriteFile(filepath.Join(originalBeads, "metadata.json"),
+		[]byte(`{"backend":"dolt","dolt_mode":"server"}`), 0600)
+	os.Remove(filepath.Join(originalBeads, "beads.db"))
+
+	// Rollback
+	result, err := RestoreFromBackup(townRoot, backupDir)
+	if err != nil {
+		t.Fatalf("rollback failed: %v", err)
+	}
+	if len(result.RestoredRigs) != 1 {
+		t.Fatalf("expected 1 restored rig, got %d", len(result.RestoredRigs))
+	}
+
+	// Verify rollback restored original state
+	data, _ := os.ReadFile(filepath.Join(originalBeads, "metadata.json"))
+	var meta map[string]interface{}
+	json.Unmarshal(data, &meta)
+	if meta["backend"] != "sqlite" {
+		t.Errorf("after rollback: backend = %v, want sqlite", meta["backend"])
+	}
+	dbData, _ := os.ReadFile(filepath.Join(originalBeads, "beads.db"))
+	if string(dbData) != "original-data" {
+		t.Errorf("beads.db content = %q, want original-data", string(dbData))
+	}
+}
+
+// =============================================================================
+// Spaces in paths
+// =============================================================================
+
+func TestFindMigratableDatabases_SpacesInPath(t *testing.T) {
+	townRoot := filepath.Join(t.TempDir(), "my town root")
+	if err := os.MkdirAll(townRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	rigName := "my-rig"
+	sourceDolt := filepath.Join(townRoot, rigName, ".beads", "dolt", "beads", ".dolt")
+	if err := os.MkdirAll(sourceDolt, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	migrations := FindMigratableDatabases(townRoot)
+	found := false
+	for _, m := range migrations {
+		if m.RigName == rigName {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected to find migration in path with spaces")
+	}
+}
+
+func TestFindMigratableDatabases_EmptyTownRoot(t *testing.T) {
+	townRoot := t.TempDir()
+	migrations := FindMigratableDatabases(townRoot)
+	if len(migrations) != 0 {
+		t.Errorf("expected 0 migrations, got %d", len(migrations))
+	}
+}
+
+func TestFindMigratableDatabases_TownBeads(t *testing.T) {
+	townRoot := t.TempDir()
+	hqSource := filepath.Join(townRoot, ".beads", "dolt", "beads", ".dolt")
+	if err := os.MkdirAll(hqSource, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	migrations := FindMigratableDatabases(townRoot)
+	found := false
+	for _, m := range migrations {
+		if m.RigName == "hq" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected to find HQ migration")
+	}
+}
+
+func TestFindMigratableDatabases_SkipsDotDirs(t *testing.T) {
+	townRoot := t.TempDir()
+	hiddenDolt := filepath.Join(townRoot, ".hidden-rig", ".beads", "dolt", "beads", ".dolt")
+	if err := os.MkdirAll(hiddenDolt, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	migrations := FindMigratableDatabases(townRoot)
+	for _, m := range migrations {
+		if m.RigName == ".hidden-rig" {
+			t.Error("should skip dot-directories")
+		}
+	}
+}
+
+func TestMoveDir_SourceNotExists(t *testing.T) {
+	tmpDir := t.TempDir()
+	err := moveDir(filepath.Join(tmpDir, "nonexistent"), filepath.Join(tmpDir, "dest"))
+	if err == nil {
+		t.Fatal("expected error for nonexistent source")
 	}
 }

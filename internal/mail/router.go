@@ -755,6 +755,11 @@ func (r *Router) validateRecipient(identity string) error {
 
 // sendToSingle sends a message to a single recipient.
 func (r *Router) sendToSingle(msg *Message) error {
+	// Validate message before sending
+	if err := msg.Validate(); err != nil {
+		return fmt.Errorf("invalid message: %w", err)
+	}
+
 	// Convert addresses to beads identities
 	toIdentity := AddressToIdentity(msg.To)
 
@@ -1189,6 +1194,12 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			continue
 		}
 
+		// Overseer is a human operator - use a visible banner instead of NudgeSession
+		// (which types into Claude's input and would disrupt the human's terminal).
+		if msg.To == "overseer" {
+			return r.tmux.SendNotificationBanner(sessionID, msg.From, msg.Subject)
+		}
+
 		// Send notification to the agent's conversation history
 		notification := fmt.Sprintf("📬 You have new mail from %s. Subject: %s. Run 'gt mail inbox' to read.", msg.From, msg.Subject)
 		return r.tmux.NudgeSession(sessionID, notification)
@@ -1205,6 +1216,11 @@ func (r *Router) notifyRecipient(msg *Message) error {
 // This supersedes the approach in PR #896 which only handled slash-to-dash
 // conversion but didn't address the crew/polecat ambiguity.
 func addressToSessionIDs(address string) []string {
+	// Overseer address: "overseer" (human operator)
+	if address == "overseer" {
+		return []string{session.OverseerSessionName()}
+	}
+
 	// Mayor address: "mayor/" or "mayor"
 	if strings.HasPrefix(address, "mayor") {
 		return []string{session.MayorSessionName()}

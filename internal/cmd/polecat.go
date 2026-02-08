@@ -250,6 +250,7 @@ var (
 	polecatStaleJSON      bool
 	polecatStaleThreshold int
 	polecatStaleCleanup   bool
+	polecatStaleDryRun    bool
 )
 
 var polecatStaleCmd = &cobra.Command{
@@ -311,6 +312,7 @@ func init() {
 	polecatStaleCmd.Flags().BoolVar(&polecatStaleJSON, "json", false, "Output as JSON")
 	polecatStaleCmd.Flags().IntVar(&polecatStaleThreshold, "threshold", 20, "Commits behind main to consider stale")
 	polecatStaleCmd.Flags().BoolVar(&polecatStaleCleanup, "cleanup", false, "Automatically nuke stale polecats")
+	polecatStaleCmd.Flags().BoolVar(&polecatStaleDryRun, "dry-run", false, "Show what would be cleaned without doing it")
 
 	// Add subcommands
 	polecatCmd.AddCommand(polecatListCmd)
@@ -1353,7 +1355,7 @@ func runPolecatStale(cmd *cobra.Command, args []string) error {
 	// Cleanup if requested
 	if polecatStaleCleanup && staleCount > 0 {
 		fmt.Println()
-		if polecatNukeDryRun {
+		if polecatStaleDryRun {
 			fmt.Printf("Would clean up %d stale polecat(s):\n", staleCount)
 			for _, info := range staleInfos {
 				if info.IsStale {

@@ -65,6 +65,10 @@ type SessionStartOptions struct {
 	// RuntimeConfigDir is resolved config directory for the runtime account.
 	// If set, this is injected as an environment variable.
 	RuntimeConfigDir string
+
+	// DoltBranch is the polecat-specific Dolt branch for write isolation.
+	// If set, BD_BRANCH env var is injected into the polecat session.
+	DoltBranch string
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -147,15 +151,21 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	sessionID := m.SessionName(polecat)
 
-	// Check if session already exists
-	// Note: Orphan sessions are cleaned up by ReconcilePool during AllocateName,
-	// so by this point, any existing session should be legitimately in use.
+	// Check if session already exists.
+	// If an existing session's pane process has died, kill the stale session
+	// and proceed rather than returning ErrSessionRunning (gt-jn40ft).
 	running, err := m.tmux.HasSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
 	if running {
-		return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		if m.isSessionStale(sessionID) {
+			if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
+				return fmt.Errorf("killing stale session %s: %w", sessionID, err)
+			}
+		} else {
+			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		}
 	}
 
 	// Determine working directory
@@ -209,6 +219,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		command = config.PrependEnv(command, map[string]string{runtimeConfig.Session.ConfigDirEnv: opts.RuntimeConfigDir})
 	}
 
+	// Branch-per-polecat: inject BD_BRANCH into startup command
+	if opts.DoltBranch != "" {
+		command = config.PrependEnv(command, map[string]string{"BD_BRANCH": opts.DoltBranch})
+	}
+
 	// Create session with command directly to avoid send-keys race condition.
 	// See: https://github.com/anthropics/gastown/issues/280
 	if err := m.tmux.NewSessionWithCommand(sessionID, workDir, command); err != nil {
@@ -228,6 +243,12 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	})
 	for k, v := range envVars {
 		debugSession("SetEnvironment "+k, m.tmux.SetEnvironment(sessionID, k, v))
+	}
+
+	// Branch-per-polecat: set BD_BRANCH in tmux session environment
+	// This ensures respawned processes also inherit the branch setting.
+	if opts.DoltBranch != "" {
+		debugSession("SetEnvironment BD_BRANCH", m.tmux.SetEnvironment(sessionID, "BD_BRANCH", opts.DoltBranch))
 	}
 
 	// Hook the issue to the polecat if provided via --issue flag
@@ -292,6 +313,14 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 
 	return nil
+}
+
+// isSessionStale checks if a tmux session's pane process has died.
+// A stale session exists in tmux but its main process (the agent) is no longer running.
+// This happens when the agent crashes during startup but tmux keeps the dead pane.
+// Delegates to isSessionProcessDead to avoid duplicating process-check logic (gt-qgzj1h).
+func (m *SessionManager) isSessionStale(sessionID string) bool {
+	return isSessionProcessDead(m.tmux, sessionID)
 }
 
 // Stop terminates a polecat session.

@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -18,12 +20,14 @@ import (
 var nudgeMessageFlag string
 var nudgeForceFlag bool
 var nudgeIfFreshFlag bool
+var nudgeStdinFlag bool
 
 func init() {
 	rootCmd.AddCommand(nudgeCmd)
 	nudgeCmd.Flags().StringVarP(&nudgeMessageFlag, "message", "m", "", "Message to send")
 	nudgeCmd.Flags().BoolVarP(&nudgeForceFlag, "force", "f", false, "Send even if target has DND enabled")
 	nudgeCmd.Flags().BoolVar(&nudgeIfFreshFlag, "if-fresh", false, "Only send if caller's tmux session is <60s old (suppresses compaction nudges)")
+	nudgeCmd.Flags().BoolVar(&nudgeStdinFlag, "stdin", false, "Read message from stdin (avoids shell quoting issues)")
 }
 
 var nudgeCmd = &cobra.Command{
@@ -65,7 +69,14 @@ Examples:
   gt nudge mayor "Status update requested"
   gt nudge witness "Check polecat health"
   gt nudge deacon session-started
-  gt nudge channel:workers "New priority work available"`,
+  gt nudge channel:workers "New priority work available"
+
+  # Use --stdin for messages with special characters or formatting:
+  gt nudge gastown/alpha --stdin <<'EOF'
+  Status update:
+  - Task 1: complete
+  - Task 2: in progress
+  EOF`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: runNudge,
 }
@@ -93,6 +104,18 @@ func runNudge(cmd *cobra.Command, args []string) error {
 	}
 
 	target := args[0]
+
+	// Handle --stdin: read message from stdin (avoids shell quoting issues)
+	if nudgeStdinFlag {
+		if nudgeMessageFlag != "" {
+			return fmt.Errorf("cannot use --stdin with --message/-m")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("reading stdin: %w", err)
+		}
+		nudgeMessageFlag = strings.TrimRight(string(data), "\n")
+	}
 
 	// Get message from -m flag or positional arg
 	var message string

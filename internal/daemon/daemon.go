@@ -198,6 +198,19 @@ func (d *Daemon) Run() error {
 		}
 	}
 
+	// Start dedicated Dolt health check ticker if Dolt server is configured.
+	// This runs at a much higher frequency (default 30s) than the general
+	// heartbeat (3 min) so Dolt crashes are detected quickly.
+	var doltHealthTicker *time.Ticker
+	var doltHealthChan <-chan time.Time
+	if d.doltServer != nil && d.doltServer.IsEnabled() {
+		interval := d.doltServer.HealthCheckInterval()
+		doltHealthTicker = time.NewTicker(interval)
+		doltHealthChan = doltHealthTicker.C
+		defer doltHealthTicker.Stop()
+		d.logger.Printf("Dolt health check ticker started (interval %v)", interval)
+	}
+
 	// Initial heartbeat
 	d.heartbeat(state)
 
@@ -215,6 +228,13 @@ func (d *Daemon) Run() error {
 			} else {
 				d.logger.Printf("Received signal %v, shutting down", sig)
 				return d.shutdown(state)
+			}
+
+		case <-doltHealthChan:
+			// Dedicated Dolt health check — fast crash detection independent
+			// of the 3-minute general heartbeat.
+			if !d.isShutdownInProgress() {
+				d.ensureDoltServerRunning()
 			}
 
 		case <-timer.C:
@@ -1057,8 +1077,9 @@ func (d *Daemon) Stop() {
 // This prevents the daemon from fighting shutdown by auto-restarting killed agents.
 //
 // Uses flock to check actual lock status rather than file existence, since
-// the lock file may persist after shutdown completes. If the file exists but
-// is not locked, it is removed as self-healing cleanup.
+// the lock file persists after shutdown completes. The file is intentionally
+// never removed: flock works on file descriptors, not paths, and removing
+// the file while another process waits on the flock defeats mutual exclusion.
 func (d *Daemon) isShutdownInProgress() bool {
 	lockPath := filepath.Join(d.config.TownRoot, "daemon", "shutdown.lock")
 
@@ -1077,9 +1098,9 @@ func (d *Daemon) isShutdownInProgress() bool {
 
 	if locked {
 		// We acquired the lock, so no shutdown is holding it
-		// Release immediately and clean up stale file
+		// Release immediately; leave the file in place so all
+		// concurrent callers flock the same inode.
 		_ = lock.Unlock()
-		_ = os.Remove(lockPath) // Self-healing: remove orphaned lock file
 		return false
 	}
 

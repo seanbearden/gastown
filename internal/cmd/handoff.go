@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,6 +58,7 @@ var (
 	handoffSubject string
 	handoffMessage string
 	handoffCollect bool
+	handoffStdin   bool
 )
 
 func init() {
@@ -65,10 +67,23 @@ func init() {
 	handoffCmd.Flags().StringVarP(&handoffSubject, "subject", "s", "", "Subject for handoff mail (optional)")
 	handoffCmd.Flags().StringVarP(&handoffMessage, "message", "m", "", "Message body for handoff mail (optional)")
 	handoffCmd.Flags().BoolVarP(&handoffCollect, "collect", "c", false, "Auto-collect state (status, inbox, beads) into handoff message")
+	handoffCmd.Flags().BoolVar(&handoffStdin, "stdin", false, "Read message body from stdin (avoids shell quoting issues)")
 	rootCmd.AddCommand(handoffCmd)
 }
 
 func runHandoff(cmd *cobra.Command, args []string) error {
+	// Handle --stdin: read message body from stdin (avoids shell quoting issues)
+	if handoffStdin {
+		if handoffMessage != "" {
+			return fmt.Errorf("cannot use --stdin with --message/-m")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("reading stdin: %w", err)
+		}
+		handoffMessage = strings.TrimRight(string(data), "\n")
+	}
+
 	// Check if we're a polecat - polecats use gt done instead
 	// GT_POLECAT is set by the session manager when starting polecat sessions
 	if polecatName := os.Getenv("GT_POLECAT"); polecatName != "" {

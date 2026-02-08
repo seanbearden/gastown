@@ -285,6 +285,20 @@ func TestManagerList(t *testing.T) {
 	if len(workers) != 2 {
 		t.Errorf("expected 2 workers, got %d", len(workers))
 	}
+
+	// Create a dot-prefixed directory (e.g. .claude) — should be skipped
+	dotDir := filepath.Join(rigPath, "crew", ".claude")
+	if err := os.MkdirAll(dotDir, 0755); err != nil {
+		t.Fatalf("failed to create .claude dir: %v", err)
+	}
+
+	workers, err = mgr.List()
+	if err != nil {
+		t.Fatalf("List failed after adding dot dir: %v", err)
+	}
+	if len(workers) != 2 {
+		t.Errorf("expected 2 workers (dot-prefixed dir should be skipped), got %d", len(workers))
+	}
 }
 
 func TestManagerRemove(t *testing.T) {

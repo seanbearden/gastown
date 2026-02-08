@@ -821,11 +821,11 @@ func runSwarmCancel(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("checking swarm status: %w", err)
 	}
 
-	var issue struct {
+	var issues []struct {
 		Status string `json:"status"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &issue); err == nil {
-		if issue.Status == "closed" {
+	if err := json.Unmarshal(stdout.Bytes(), &issues); err == nil && len(issues) > 0 {
+		if issues[0].Status == "closed" {
 			return fmt.Errorf("swarm already closed")
 		}
 	}

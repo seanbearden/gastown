@@ -262,7 +262,7 @@ func (m *Manager) List() ([]*CrewWorker, error) {
 
 	var workers []*CrewWorker
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 

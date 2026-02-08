@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
@@ -505,6 +506,21 @@ func runDone(cmd *cobra.Command, args []string) error {
 	}
 
 notifyWitness:
+	// Branch-per-polecat: merge polecat's Dolt branch to main.
+	// This makes all beads changes (MR bead, issue updates) visible on main
+	// before the refinery or witness try to read them.
+	if bdBranch := os.Getenv("BD_BRANCH"); bdBranch != "" {
+		fmt.Printf("Merging Dolt branch %s to main...\n", bdBranch)
+		if err := doltserver.MergePolecatBranch(townRoot, rigName, bdBranch); err != nil {
+			style.PrintWarning("could not merge Dolt branch: %v (data still on branch %s)", err, bdBranch)
+		} else {
+			fmt.Printf("%s Dolt branch merged to main\n", style.Bold.Render("✓"))
+		}
+		// Unset BD_BRANCH so subsequent bd operations (updateAgentStateOnDone)
+		// write directly to main instead of the now-deleted branch.
+		os.Unsetenv("BD_BRANCH")
+	}
+
 	// Notify Witness about completion
 	// Use town-level beads for cross-agent mail
 	townRouter := mail.NewRouter(townRoot)
@@ -538,20 +554,20 @@ notifyWitness:
 		fmt.Printf("%s Witness notified of %s\n", style.Bold.Render("✓"), exitType)
 	}
 
-	// Notify dispatcher if work was dispatched by another agent
+	// Notify witness of work completion (witness is the polecat's direct supervisor).
+	// Previously this went to the dispatcher (often mayor), flooding mayor's inbox
+	// with routine operational mail. The witness handles polecat lifecycle.
 	if issueID != "" {
-		if dispatcher := getDispatcherFromBead(cwd, issueID); dispatcher != "" && dispatcher != sender {
-			dispatcherNotification := &mail.Message{
-				To:      dispatcher,
-				From:    sender,
-				Subject: fmt.Sprintf("WORK_DONE: %s", issueID),
-				Body:    strings.Join(bodyLines, "\n"),
-			}
-			if err := townRouter.Send(dispatcherNotification); err != nil {
-				style.PrintWarning("could not notify dispatcher %s: %v", dispatcher, err)
-			} else {
-				fmt.Printf("%s Dispatcher %s notified of %s\n", style.Bold.Render("✓"), dispatcher, exitType)
-			}
+		workDoneNotification := &mail.Message{
+			To:      witnessAddr,
+			From:    sender,
+			Subject: fmt.Sprintf("WORK_DONE: %s", issueID),
+			Body:    strings.Join(bodyLines, "\n"),
+		}
+		if err := townRouter.Send(workDoneNotification); err != nil {
+			style.PrintWarning("could not notify witness of work done: %v", err)
+		} else {
+			fmt.Printf("%s Witness notified of WORK_DONE for %s\n", style.Bold.Render("✓"), issueID)
 		}
 	}
 
@@ -776,27 +792,6 @@ func getIssueFromAgentHook(bd *beads.Beads, agentBeadID string) string {
 		return ""
 	}
 	return agentBead.HookBead
-}
-
-// getDispatcherFromBead retrieves the dispatcher agent ID from the bead's attachment fields.
-// Returns empty string if no dispatcher is recorded.
-func getDispatcherFromBead(cwd, issueID string) string {
-	if issueID == "" {
-		return ""
-	}
-
-	bd := beads.New(beads.ResolveBeadsDir(cwd))
-	issue, err := bd.Show(issueID)
-	if err != nil {
-		return ""
-	}
-
-	fields := beads.ParseAttachmentFields(issue)
-	if fields == nil {
-		return ""
-	}
-
-	return fields.DispatchedBy
 }
 
 // parseCleanupStatus converts a string flag value to a CleanupStatus.
