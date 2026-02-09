@@ -1429,13 +1429,13 @@ func TestHasConnectionCapacity_ZeroMax(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// HasConnectionCapacity should return true (optimistic) when query fails
+	// HasConnectionCapacity should return false (fail closed) when query fails (gt-lfc0d)
 	hasCapacity, _, err := HasConnectionCapacity(townRoot)
 	if err == nil {
 		t.Skip("Dolt server is actually running, cannot test offline case")
 	}
-	if !hasCapacity {
-		t.Error("expected optimistic true when server is unreachable")
+	if hasCapacity {
+		t.Error("expected fail-closed false when server is unreachable")
 	}
 }
 

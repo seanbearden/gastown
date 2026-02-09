@@ -1034,7 +1034,8 @@ func GetActiveConnectionCount(townRoot string) (int, error) {
 
 // HasConnectionCapacity checks whether the Dolt server has capacity for new connections.
 // Returns true if the active connection count is below the threshold (80% of max_connections).
-// Returns true (optimistic) if the connection count cannot be determined.
+// Returns false with error if the connection count cannot be determined — fail closed
+// to prevent connection storms that cause read-only mode (gt-lfc0d).
 func HasConnectionCapacity(townRoot string) (bool, int, error) {
 	config := DefaultConfig(townRoot)
 	maxConn := config.MaxConnections
@@ -1044,8 +1045,8 @@ func HasConnectionCapacity(townRoot string) (bool, int, error) {
 
 	active, err := GetActiveConnectionCount(townRoot)
 	if err != nil {
-		// Optimistic: if we can't check, allow the spawn
-		return true, 0, err
+		// Fail closed: if we can't check, the server may be overloaded
+		return false, 0, err
 	}
 
 	// Use 80% threshold to leave headroom for existing operations
@@ -1245,6 +1246,52 @@ func doltSQL(townRoot, rigDB, query string) error {
 	return nil
 }
 
+// doltSQLWithRetry executes a SQL statement with exponential backoff on transient errors.
+func doltSQLWithRetry(townRoot, rigDB, query string) error {
+	const maxRetries = 5
+	const baseBackoff = 500 * time.Millisecond
+	const maxBackoff = 15 * time.Second
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := doltSQL(townRoot, rigDB, query); err != nil {
+			lastErr = err
+			if !isDoltRetryableError(err) {
+				return err
+			}
+			if attempt < maxRetries {
+				backoff := baseBackoff
+				for i := 1; i < attempt; i++ {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+						break
+					}
+				}
+				time.Sleep(backoff)
+			}
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("after %d retries: %w", maxRetries, lastErr)
+}
+
+// isDoltRetryableError returns true if the error is a transient Dolt failure worth retrying.
+// Covers manifest lock contention, read-only mode, optimistic lock failures, and timeouts.
+func isDoltRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database is read only") ||
+		strings.Contains(msg, "cannot update manifest") ||
+		strings.Contains(msg, "optimistic lock") ||
+		strings.Contains(msg, "serialization failure") ||
+		strings.Contains(msg, "lock wait timeout") ||
+		strings.Contains(msg, "try restarting transaction")
+}
+
 // validBranchNameRe matches only safe branch name characters: alphanumeric, hyphen,
 // underscore, dot, and forward slash. This prevents SQL injection via branch names
 // interpolated into Dolt stored procedure calls.
@@ -1271,32 +1318,58 @@ func PolecatBranchName(polecatName string) string {
 
 // CreatePolecatBranch creates a Dolt branch for a polecat's isolated writes.
 // Each polecat gets its own branch to eliminate optimistic lock contention.
+// Retries with exponential backoff on transient errors (read-only, manifest lock, etc).
 func CreatePolecatBranch(townRoot, rigDB, branchName string) error {
 	if err := validateBranchName(branchName); err != nil {
 		return fmt.Errorf("creating Dolt branch in %s: %w", rigDB, err)
 	}
 	query := fmt.Sprintf("CALL DOLT_BRANCH('%s')", branchName)
-	if err := doltSQL(townRoot, rigDB, query); err != nil {
-		return fmt.Errorf("creating Dolt branch %s in %s: %w", branchName, rigDB, err)
+
+	const maxRetries = 5
+	const baseBackoff = 500 * time.Millisecond
+	const maxBackoff = 15 * time.Second
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := doltSQL(townRoot, rigDB, query); err != nil {
+			lastErr = err
+			if !isDoltRetryableError(err) {
+				return fmt.Errorf("creating Dolt branch %s in %s: %w", branchName, rigDB, err)
+			}
+			if attempt < maxRetries {
+				backoff := baseBackoff
+				for i := 1; i < attempt; i++ {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+						break
+					}
+				}
+				time.Sleep(backoff)
+			}
+			continue
+		}
+		return nil
 	}
-	return nil
+	return fmt.Errorf("creating Dolt branch %s in %s after %d retries: %w", branchName, rigDB, maxRetries, lastErr)
 }
 
 // MergePolecatBranch merges a polecat's Dolt branch into main and deletes it.
 // Called at gt done time to make the polecat's beads changes visible.
+// Retries each step with exponential backoff on transient errors.
 func MergePolecatBranch(townRoot, rigDB, branchName string) error {
 	if err := validateBranchName(branchName); err != nil {
 		return fmt.Errorf("merging Dolt branch in %s: %w", rigDB, err)
 	}
 	// Checkout main, merge, delete branch — each as separate commands
 	// to avoid multi-statement parsing issues with dolt sql CLI.
-	if err := doltSQL(townRoot, rigDB, "CALL DOLT_CHECKOUT('main')"); err != nil {
+	if err := doltSQLWithRetry(townRoot, rigDB, "CALL DOLT_CHECKOUT('main')"); err != nil {
 		return fmt.Errorf("checkout main in %s: %w", rigDB, err)
 	}
-	if err := doltSQL(townRoot, rigDB, fmt.Sprintf("CALL DOLT_MERGE('%s')", branchName)); err != nil {
+	if err := doltSQLWithRetry(townRoot, rigDB, fmt.Sprintf("CALL DOLT_MERGE('%s')", branchName)); err != nil {
 		return fmt.Errorf("merging %s to main in %s: %w", branchName, rigDB, err)
 	}
-	if err := doltSQL(townRoot, rigDB, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", branchName)); err != nil {
+	if err := doltSQLWithRetry(townRoot, rigDB, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", branchName)); err != nil {
 		// Non-fatal: branch deletion failure doesn't lose data
 		fmt.Printf("Warning: could not delete Dolt branch %s: %v\n", branchName, err)
 	}
