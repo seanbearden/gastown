@@ -217,6 +217,30 @@ func processExists(pid int) bool {
 	return err == nil || err == syscall.EPERM
 }
 
+// isIDEClaudeProcess checks if a Claude process was spawned by an IDE extension
+// (VS Code, Cursor, etc.). IDE-launched Claude processes run with TTY "?" but
+// are legitimate — they're controlled by the IDE, not orphaned from dead sessions.
+func isIDEClaudeProcess(pid int) bool {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+	if err != nil {
+		return false
+	}
+	args := string(out)
+	// Check for IDE-specific paths in the executable
+	if strings.Contains(args, "vscode-server") ||
+		strings.Contains(args, "vscode/extensions") ||
+		strings.Contains(args, ".cursor-server") ||
+		strings.Contains(args, ".cursor/extensions") {
+		return true
+	}
+	// Generic IDE detection: stream-json I/O is specific to IDE extensions
+	if strings.Contains(args, "--output-format stream-json") &&
+		strings.Contains(args, "--input-format stream-json") {
+		return true
+	}
+	return false
+}
+
 // parseEtime parses ps etime format into seconds.
 // Format: [[DD-]HH:]MM:SS
 // Examples: "01:23" (83s), "01:02:03" (3723s), "2-01:02:03" (176523s)
@@ -334,6 +358,12 @@ func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 			continue
 		}
 
+		// Skip IDE extension processes (VS Code, Cursor, etc.).
+		// These have TTY "?" but are legitimate — controlled by the IDE.
+		if isIDEClaudeProcess(pid) {
+			continue
+		}
+
 		// Skip processes younger than minOrphanAge seconds
 		// This prevents killing newly spawned subagents and reduces false positives
 		age, err := parseEtime(etimeStr)
@@ -369,14 +399,10 @@ type ZombieProcess struct {
 	TTY string // TTY column from ps (may be "?" or a session like "s024")
 }
 
-// FindZombieClaudeProcesses finds Claude processes NOT in any active tmux session.
-// This catches "zombie" processes that have a TTY but whose tmux session is dead.
-//
-// Unlike FindOrphanedClaudeProcesses (which uses TTY="?" detection), this function
-// uses tmux pane verification: a process is a zombie if it's NOT the pane PID of
-// any active tmux session AND not a child of any pane PID.
-//
-// This is the definitive zombie check because it verifies against tmux reality.
+// FindZombieClaudeProcesses finds Claude processes with no TTY that are NOT in
+// any active tmux session. This catches "zombie" processes whose tmux session
+// has died. Processes with a real TTY (e.g. pts/*) are skipped because those
+// are interactive terminal sessions, not zombies.
 func FindZombieClaudeProcesses() ([]ZombieProcess, error) {
 	// Get ALL valid PIDs (panes + their children) from active tmux sessions
 	validPIDs := getTmuxSessionPIDs()
@@ -424,6 +450,19 @@ func FindZombieClaudeProcesses() ([]ZombieProcess, error) {
 
 		// Skip processes that belong to valid Gas Town tmux sessions
 		if validPIDs[pid] {
+			continue
+		}
+
+		// Skip processes with a real TTY that are NOT in any tmux session.
+		// These are interactive terminal sessions (e.g. user running claude
+		// in a regular terminal), not zombies from dead tmux sessions.
+		if tty != "?" && tty != "??" {
+			continue
+		}
+
+		// Skip IDE extension processes (VS Code, Cursor, etc.).
+		// These have TTY "?" but are legitimate — controlled by the IDE.
+		if isIDEClaudeProcess(pid) {
 			continue
 		}
 
