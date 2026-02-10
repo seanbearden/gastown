@@ -714,11 +714,10 @@ func sendHandoffMail(subject, message string) (string, error) {
 	// Mail goes to town-level beads (hq- prefix)
 	args := []string{
 		"create", subject,
-		"--type", "message",
 		"--assignee", agentID,
 		"-d", message,
 		"--priority", "2",
-		"--labels", labels,
+		"--labels", labels + ",gt:message",
 		"--actor", agentID,
 		"--ephemeral", // Handoff mail is ephemeral
 		"--silent",    // Output only the bead ID
