@@ -578,6 +578,13 @@ func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {
 			continue
 		}
 
+		// TOCTOU guard: re-verify this process is still a zombie before signaling.
+		// Between FindZombieClaudeProcesses() and now, the process may have
+		// joined a tmux session or been adopted by an active session.
+		if !isProcessStillOrphaned(zombie.PID) {
+			continue
+		}
+
 		if err := syscall.Kill(zombie.PID, syscall.SIGTERM); err != nil {
 			if err != syscall.ESRCH {
 				lastErr = fmt.Errorf("SIGTERM PID %d: %w", zombie.PID, err)
@@ -679,6 +686,13 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
 			continue // Already in state, waiting for grace period
 		}
 
+		// TOCTOU guard: re-verify this process is still orphaned before signaling.
+		// Between FindOrphanedClaudeProcesses() and now, the process may have
+		// joined a tmux session or acquired a TTY.
+		if !isProcessStillOrphaned(orphan.PID) {
+			continue
+		}
+
 		// New orphan - send SIGTERM
 		if err := syscall.Kill(orphan.PID, syscall.SIGTERM); err != nil {
 			if err != syscall.ESRCH {
@@ -701,4 +715,30 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
 	}
 
 	return results, lastErr
+}
+
+// isProcessStillOrphaned re-checks whether a process is still orphaned/zombie.
+// Used for TOCTOU re-verification immediately before sending signals.
+// Returns true if the process still has no controlling terminal and is not
+// in any active tmux session (i.e., still safe to signal).
+func isProcessStillOrphaned(pid int) bool {
+	// Re-check the process TTY via ps
+	out, err := exec.Command("ps", "-o", "tty=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false // Process may have exited - not orphaned anymore
+	}
+
+	tty := strings.TrimSpace(string(out))
+	if tty == "" {
+		return false // Process gone
+	}
+
+	// If it now has a real TTY, it's been adopted
+	if tty != "?" && tty != "??" {
+		return false
+	}
+
+	// Re-check against current tmux session PIDs
+	protectedPIDs := getTmuxSessionPIDs()
+	return !protectedPIDs[pid]
 }
