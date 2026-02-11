@@ -101,12 +101,13 @@ func TestInstallBeadsHasCorrectPrefix(t *testing.T) {
 	beadsDir := filepath.Join(hqPath, ".beads")
 	assertDirExists(t, beadsDir, ".beads/")
 
-	// Verify beads database was initialized (metadata.json exists)
+	// Verify beads database was initialized (both metadata.json and dolt/ exist with dolt backend)
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
 	assertFileExists(t, metadataPath, ".beads/metadata.json")
+	doltDir := filepath.Join(beadsDir, "dolt")
+	assertDirExists(t, doltDir, ".beads/dolt/")
 
 	// Verify prefix by running bd config get issue_prefix
-	// Direct bd command in test environment
 	bdCmd := exec.Command("bd", "config", "get", "issue_prefix")
 	bdCmd.Dir = hqPath
 	prefixOutput, err := bdCmd.Output() // Use Output() to get only stdout

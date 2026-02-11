@@ -1,10 +1,10 @@
 package cmd
 
 import (
-	"github.com/steveyegge/gastown/internal/cli"
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/steveyegge/gastown/internal/cli"
 	"os/exec"
 	"strings"
 

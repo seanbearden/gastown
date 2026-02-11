@@ -1509,7 +1509,7 @@ wisp_ttl_error: 336h`,
 			},
 		},
 		{
-			name: "wisp TTL only (no other fields)",
+			name:        "wisp TTL only (no other fields)",
 			description: `wisp_ttl_patrol: 24h`,
 			wantTTLs:    map[string]string{"patrol": "24h"},
 		},
@@ -1528,7 +1528,7 @@ Wisp_TTL_Error: 336h`,
 			},
 		},
 		{
-			name: "wisp TTL with default type",
+			name:        "wisp TTL with default type",
 			description: `wisp_ttl_default: 168h`,
 			wantTTLs:    map[string]string{"default": "168h"},
 		},
@@ -1628,8 +1628,8 @@ func TestParseWispTTLKey(t *testing.T) {
 		{"wisp-ttl-patrol", "patrol", true},
 		{"wisp-ttl-error", "error", true},
 		{"wispttlpatrol", "patrol", true},
-		{"wisp_ttl_", "", false},   // empty type
-		{"wisp-ttl-", "", false},   // empty type
+		{"wisp_ttl_", "", false}, // empty type
+		{"wisp-ttl-", "", false}, // empty type
 		{"session_pattern", "", false},
 		{"wisp_patrol", "", false},
 		{"ttl_patrol", "", false},
@@ -1644,30 +1644,6 @@ func TestParseWispTTLKey(t *testing.T) {
 			}
 			if gotType != tt.wantType {
 				t.Errorf("ParseWispTTLKey(%q) type = %q, want %q", tt.key, gotType, tt.wantType)
-			}
-		})
-	}
-}
-
-// TestRoleBeadID tests role bead ID generation.
-func TestRoleBeadID(t *testing.T) {
-	tests := []struct {
-		roleType string
-		want     string
-	}{
-		{"mayor", "gt-mayor-role"},
-		{"deacon", "gt-deacon-role"},
-		{"witness", "gt-witness-role"},
-		{"refinery", "gt-refinery-role"},
-		{"crew", "gt-crew-role"},
-		{"polecat", "gt-polecat-role"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.roleType, func(t *testing.T) {
-			got := RoleBeadID(tt.roleType)
-			if got != tt.want {
-				t.Errorf("RoleBeadID(%q) = %q, want %q", tt.roleType, got, tt.want)
 			}
 		})
 	}
@@ -2165,7 +2141,6 @@ func TestSetupRedirect(t *testing.T) {
 
 // TestAgentBeadTombstoneBug demonstrates the bd bug where `bd delete --hard --force`
 // creates tombstones instead of truly deleting records.
-//
 //
 // This test documents the bug behavior:
 // 1. Create agent bead

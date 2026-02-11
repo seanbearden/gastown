@@ -9,11 +9,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
+
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
-	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
@@ -112,11 +114,38 @@ func (m *Manager) exists(name string) bool {
 	return err == nil
 }
 
+// lockCrew acquires an exclusive file lock for a specific crew worker.
+// This prevents concurrent gt processes from racing on the same crew worker's
+// filesystem operations (Add, Remove, Rename, Start).
+// Caller must defer fl.Unlock().
+func (m *Manager) lockCrew(name string) (*flock.Flock, error) {
+	lockDir := filepath.Join(m.rig.Path, ".runtime", "locks")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating lock dir: %w", err)
+	}
+	lockPath := filepath.Join(lockDir, fmt.Sprintf("crew-%s.lock", name))
+	fl := flock.New(lockPath)
+	if err := fl.Lock(); err != nil {
+		return nil, fmt.Errorf("acquiring crew lock for %s: %w", name, err)
+	}
+	return fl, nil
+}
+
 // Add creates a new crew worker with a clone of the rig.
 func (m *Manager) Add(name string, createBranch bool) (*CrewWorker, error) {
 	if err := validateCrewName(name); err != nil {
 		return nil, err
 	}
+	fl, err := m.lockCrew(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fl.Unlock() }()
+	return m.addLocked(name, createBranch)
+}
+
+// addLocked creates a new crew worker, assumes caller holds lockCrew(name).
+func (m *Manager) addLocked(name string, createBranch bool) (*CrewWorker, error) {
 	if m.exists(name) {
 		return nil, ErrCrewExists
 	}
@@ -277,6 +306,11 @@ func (m *Manager) Remove(name string, force bool) error {
 	if err := validateCrewName(name); err != nil {
 		return err
 	}
+	fl, err := m.lockCrew(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
 	if !m.exists(name) {
 		return ErrCrewNotFound
 	}
@@ -332,6 +366,16 @@ func (m *Manager) Get(name string) (*CrewWorker, error) {
 	if err := validateCrewName(name); err != nil {
 		return nil, err
 	}
+	fl, err := m.lockCrew(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fl.Unlock() }()
+	return m.getLocked(name)
+}
+
+// getLocked returns a crew worker, assumes caller holds lockCrew(name).
+func (m *Manager) getLocked(name string) (*CrewWorker, error) {
 	if !m.exists(name) {
 		return nil, ErrCrewNotFound
 	}
@@ -389,6 +433,21 @@ func (m *Manager) Rename(oldName, newName string) error {
 	if err := validateCrewName(newName); err != nil {
 		return err
 	}
+	// Lock both names in alphabetical order to prevent deadlock.
+	first, second := oldName, newName
+	if first > second {
+		first, second = second, first
+	}
+	fl1, err := m.lockCrew(first)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl1.Unlock() }()
+	fl2, err := m.lockCrew(second)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl2.Unlock() }()
 	if !m.exists(oldName) {
 		return ErrCrewNotFound
 	}
@@ -491,10 +550,17 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		return err
 	}
 
-	// Get or create the crew worker
-	worker, err := m.Get(name)
+	// Acquire lock to prevent concurrent Start/Remove races.
+	fl, err := m.lockCrew(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	// Get or create the crew worker (using locked variants to avoid lock re-entry)
+	worker, err := m.getLocked(name)
 	if err == ErrCrewNotFound {
-		worker, err = m.Add(name, false) // No feature branch for crew
+		worker, err = m.addLocked(name, false) // No feature branch for crew
 		if err != nil {
 			return fmt.Errorf("creating crew workspace: %w", err)
 		}
@@ -553,24 +619,7 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		Topic:     topic,
 	})
 
-	// Compute environment variables BEFORE creating the session.
-	// These are passed via tmux -e flags so the initial shell inherits the correct
-	// env from the start, preventing parent env (e.g., GT_ROLE=mayor) from leaking
-	// into crew sessions. See: https://github.com/steveyegge/gastown/issues/1289
-	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:             "crew",
-		Rig:              m.rig.Name,
-		AgentName:        name,
-		TownRoot:         townRoot,
-		RuntimeConfigDir: opts.ClaudeConfigDir,
-		BeadsNoDaemon:    true,
-	})
-	if opts.AgentOverride != "" {
-		envVars["GT_AGENT"] = opts.AgentOverride
-	}
-
-	// Build startup command (also includes env vars via 'exec env' for
-	// WaitForCommand detection — belt and suspenders with -e flags)
+	// Build startup command first
 	// SessionStart hook handles context loading (gt prime --hook)
 	claudeCmd, err := config.BuildCrewStartupCommandWithAgentOverride(m.rig.Name, name, m.rig.Path, beacon, opts.AgentOverride)
 	if err != nil {
@@ -582,13 +631,30 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		claudeCmd = strings.Replace(claudeCmd, " --dangerously-skip-permissions", "", 1)
 	}
 
-	// Create session with command and env vars via -e flags.
-	// The -e flags set session-level env BEFORE the shell starts, ensuring the
-	// initial shell inherits the correct GT_ROLE (not the parent's).
-	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
-	// See: https://github.com/steveyegge/gastown/issues/1289 (env inheritance fix)
-	if err := t.NewSessionWithCommandAndEnv(sessionID, worker.ClonePath, claudeCmd, envVars); err != nil {
+	// Create session with command directly to avoid send-keys race condition.
+	// See: https://github.com/anthropics/gastown/issues/280
+	if err := t.NewSessionWithCommand(sessionID, worker.ClonePath, claudeCmd); err != nil {
 		return fmt.Errorf("creating session: %w", err)
+	}
+
+	// Set environment variables (non-fatal: session works without these)
+	// Use centralized AgentEnv for consistency across all role startup paths
+	envVars := config.AgentEnv(config.AgentEnvConfig{
+		Role:             "crew",
+		Rig:              m.rig.Name,
+		AgentName:        name,
+		TownRoot:         townRoot,
+		RuntimeConfigDir: opts.ClaudeConfigDir,
+	})
+	for k, v := range envVars {
+		_ = t.SetEnvironment(sessionID, k, v)
+	}
+
+	// Persist agent override in tmux session env so handoff can read it back.
+	// The startup command sets GT_AGENT via exec env, but that only lives in the
+	// process tree. The tmux session env survives respawn-pane and is queryable.
+	if opts.AgentOverride != "" {
+		_ = t.SetEnvironment(sessionID, "GT_AGENT", opts.AgentOverride)
 	}
 
 	// Apply rig-based theming (non-fatal: theming failure doesn't affect operation)
@@ -643,4 +709,3 @@ func (m *Manager) IsRunning(name string) (bool, error) {
 	sessionID := m.SessionName(name)
 	return t.HasSession(sessionID)
 }
-

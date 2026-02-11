@@ -262,10 +262,10 @@ func TestGetIssueFromAgentHook(t *testing.T) {
 	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
 
 	tests := []struct {
-		name         string
-		agentBeadID  string
-		setupBeads   func(t *testing.T, bd *beads.Beads) // setup agent bead with hook
-		wantIssueID  string
+		name        string
+		agentBeadID string
+		setupBeads  func(t *testing.T, bd *beads.Beads) // setup agent bead with hook
+		wantIssueID string
 	}{
 		{
 			name:        "agent with hook_bead returns issue ID",

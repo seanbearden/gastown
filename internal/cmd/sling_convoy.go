@@ -191,4 +191,3 @@ func createAutoConvoy(beadID, beadTitle string) (string, error) {
 
 	return convoyID, nil
 }
-

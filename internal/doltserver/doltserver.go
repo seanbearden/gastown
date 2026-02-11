@@ -632,6 +632,59 @@ type Migration struct {
 	TargetPath string
 }
 
+// findLocalDoltDB scans beadsDir/dolt/ for a subdirectory containing a .dolt
+// directory (an embedded Dolt database). Returns the full path to the database
+// directory, or "" if none found.
+//
+// bd names the subdirectory based on internal conventions (e.g., beads_hq,
+// beads_gt) that have changed across versions. Scanning avoids hardcoding
+// assumptions about the naming scheme.
+//
+// If multiple databases are found, returns "" and logs a warning to stderr.
+// Callers should not silently pick one — ambiguity requires manual resolution.
+func findLocalDoltDB(beadsDir string) string {
+	doltParent := filepath.Join(beadsDir, "dolt")
+	entries, err := os.ReadDir(doltParent)
+	if err != nil {
+		return ""
+	}
+	var candidates []string
+	for _, e := range entries {
+		// Resolve symlinks: DirEntry.IsDir() returns false for symlinks-to-directories
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, err := filepath.EvalSymlinks(filepath.Join(doltParent, e.Name()))
+			if err != nil {
+				continue
+			}
+			fi, err := os.Stat(resolved)
+			if err != nil || !fi.IsDir() {
+				continue
+			}
+		} else if !e.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(doltParent, e.Name())
+		if _, err := os.Stat(filepath.Join(candidate, ".dolt")); err == nil {
+			candidates = append(candidates, candidate)
+		}
+	}
+	if len(candidates) == 0 {
+		if len(entries) > 0 {
+			fmt.Fprintf(os.Stderr, "[doltserver] Warning: %s exists but contains no valid dolt database\n", doltParent)
+		}
+		return ""
+	}
+	if len(candidates) > 1 {
+		fmt.Fprintf(os.Stderr, "[doltserver] Warning: multiple dolt databases found in %s: %v — manual resolution required\n", doltParent, candidates)
+		return ""
+	}
+	return candidates[0]
+}
+
 // FindMigratableDatabases finds existing dolt databases that can be migrated.
 func FindMigratableDatabases(townRoot string) []Migration {
 	var migrations []Migration
@@ -639,8 +692,8 @@ func FindMigratableDatabases(townRoot string) []Migration {
 
 	// Check town-level beads database -> .dolt-data/hq
 	townBeadsDir := beads.ResolveBeadsDir(townRoot)
-	townSource := filepath.Join(townBeadsDir, "dolt", "beads")
-	if _, err := os.Stat(filepath.Join(townSource, ".dolt")); err == nil {
+	townSource := findLocalDoltDB(townBeadsDir)
+	if townSource != "" {
 		// Check target doesn't already have data
 		targetDir := filepath.Join(config.DataDir, "hq")
 		if _, err := os.Stat(filepath.Join(targetDir, ".dolt")); os.IsNotExist(err) {
@@ -666,9 +719,9 @@ func FindMigratableDatabases(townRoot string) []Migration {
 
 		rigName := entry.Name()
 		resolvedBeadsDir := beads.ResolveBeadsDir(filepath.Join(townRoot, rigName))
-		rigSource := filepath.Join(resolvedBeadsDir, "dolt", "beads")
+		rigSource := findLocalDoltDB(resolvedBeadsDir)
 
-		if _, err := os.Stat(filepath.Join(rigSource, ".dolt")); err == nil {
+		if rigSource != "" {
 			// Check target doesn't already have data
 			targetDir := filepath.Join(config.DataDir, rigName)
 			if _, err := os.Stat(filepath.Join(targetDir, ".dolt")); os.IsNotExist(err) {
@@ -685,7 +738,7 @@ func FindMigratableDatabases(townRoot string) []Migration {
 }
 
 // MigrateRigFromBeads migrates an existing beads Dolt database to the data directory.
-// This is used to migrate from the old per-rig .beads/dolt/beads layout to the new
+// This is used to migrate from the old per-rig .beads/dolt/<db_name> layout to the new
 // centralized .dolt-data/<rigname> layout.
 func MigrateRigFromBeads(townRoot, rigName, sourcePath string) error {
 	config := DefaultConfig(townRoot)
@@ -827,8 +880,8 @@ func checkWorkspace(townRoot, rigName, beadsDir string) *BrokenWorkspace {
 	}
 
 	// Check for local data that could be migrated
-	localDoltPath := filepath.Join(beadsDir, "dolt", "beads")
-	if _, err := os.Stat(filepath.Join(localDoltPath, ".dolt")); err == nil {
+	localDoltPath := findLocalDoltDB(beadsDir)
+	if localDoltPath != "" {
 		ws.HasLocalData = true
 		ws.LocalDataPath = localDoltPath
 	}
@@ -1218,20 +1271,36 @@ func RecoverReadOnly(townRoot string) error {
 		return fmt.Errorf("failed to restart Dolt server: %w", err)
 	}
 
-	// Wait for server to be ready
-	time.Sleep(2 * time.Second)
+	// Verify recovery with exponential backoff (server may need time to become writable)
+	const maxAttempts = 5
+	const baseBackoff = 500 * time.Millisecond
+	const maxBackoff = 8 * time.Second
 
-	// Verify recovery
-	readOnly, err = CheckReadOnly(townRoot)
-	if err != nil {
-		return fmt.Errorf("post-restart probe failed: %w", err)
-	}
-	if readOnly {
-		return fmt.Errorf("Dolt server still read-only after restart")
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		backoff := baseBackoff
+		for i := 1; i < attempt; i++ {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+				break
+			}
+		}
+		time.Sleep(backoff)
+
+		readOnly, err = CheckReadOnly(townRoot)
+		if err != nil {
+			if attempt == maxAttempts {
+				return fmt.Errorf("post-restart probe failed after %d attempts: %w", maxAttempts, err)
+			}
+			continue
+		}
+		if !readOnly {
+			fmt.Printf("Dolt server recovered from read-only state\n")
+			return nil
+		}
 	}
 
-	fmt.Printf("Dolt server recovered from read-only state\n")
-	return nil
+	return fmt.Errorf("Dolt server still read-only after restart (%d verification attempts)", maxAttempts)
 }
 
 // doltSQLWithRecovery executes a SQL statement with retry logic and, if retries

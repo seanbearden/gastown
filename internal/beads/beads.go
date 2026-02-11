@@ -190,11 +190,6 @@ func (b *Beads) Init(prefix string) error {
 
 // run executes a bd command and returns stdout.
 func (b *Beads) run(args ...string) ([]byte, error) {
-	// Let bd auto-detect the backend mode.
-	// For embedded SQLite: bd detects single-process and goes direct automatically.
-	// For dolt-native rigs with a Dolt server: bd routes through the server.
-	// Forcing embedded mode broke writes to dolt-native rigs because it
-	// can't acquire the lock held by the running Dolt server (gt-i5a).
 	// Use --allow-stale to prevent failures when db is out of sync with JSONL
 	// (e.g., after daemon is killed during shutdown before syncing).
 	fullArgs := append([]string{"--allow-stale"}, args...)
@@ -428,6 +423,14 @@ func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
 
 // Show returns detailed information about an issue.
 func (b *Beads) Show(id string) (*Issue, error) {
+	// Route cross-rig queries via routes.jsonl so that rig-level bead IDs
+	// (e.g., "gt-abc123") resolve to the correct rig database.
+	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
+	if targetDir != b.getResolvedBeadsDir() {
+		target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+		return target.Show(id)
+	}
+
 	out, err := b.run("show", id, "--json")
 	if err != nil {
 		return nil, err

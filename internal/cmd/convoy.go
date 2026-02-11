@@ -819,6 +819,8 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 	for _, s := range stranded {
 		fmt.Printf("  gt sling mol-convoy-feed deacon/dogs --var convoy=%s\n", s.ID)
 	}
+	fmt.Println()
+	fmt.Println(style.Dim.Render("  Note: Pool dispatch auto-creates dogs if pool is under capacity."))
 
 	return nil
 }
@@ -1613,7 +1615,6 @@ func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 	}
 
 	// Build args: bd show id1 id2 id3 ... --json
-	// Batch show for multiple issue IDs
 	args := append([]string{"show"}, issueIDs...)
 	args = append(args, "--json")
 
