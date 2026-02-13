@@ -65,7 +65,7 @@ func CreateDoltHubRepo(org, repo, token string) error {
 	if err != nil {
 		return fmt.Errorf("DoltHub API request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// 200 = created, 409 or similar = already exists (both are fine)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
