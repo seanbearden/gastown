@@ -84,7 +84,7 @@ func init() {
 	rootCmd.AddCommand(doneCmd)
 }
 
-func runDone(cmd *cobra.Command, args []string) error {
+func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// Guard: Only polecats should call gt done
 	// Crew, deacons, witnesses etc. don't use gt done - they persist across tasks.
 	// Polecat sessions end with gt done — the session is cleaned up, but the
@@ -133,7 +133,7 @@ func runDone(cmd *cobra.Command, args []string) error {
 			if err := selfKillSession(deferredTownRoot, deferredRoleInfo); err != nil {
 				style.PrintWarning("deferred session kill failed: %v", err)
 			}
-			os.Exit(0)
+			retErr = NewSilentExit(0)
 		}
 	}()
 
@@ -798,9 +798,7 @@ notifyWitness:
 		fmt.Printf("  Witness will handle cleanup.\n")
 	}
 	fmt.Printf("  Goodbye!\n")
-	os.Exit(0)
-
-	return nil // unreachable, but keeps compiler happy
+	return NewSilentExit(0)
 }
 
 // setDoneIntentLabel writes a done-intent:<type>:<unix-ts> label on the agent bead

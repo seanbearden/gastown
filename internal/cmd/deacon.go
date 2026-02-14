@@ -815,7 +815,7 @@ Done:
 	// Check if force-kill threshold reached
 	if agentState.ShouldForceKill(healthCheckFailures) {
 		fmt.Printf("%s Agent %s should be force-killed\n", style.Bold.Render("✗"), agent)
-		os.Exit(2) // Exit code 2 = should force-kill
+		return NewSilentExit(2) // Exit code 2 = should force-kill
 	}
 
 	return nil

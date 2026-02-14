@@ -77,9 +77,7 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(os.Stderr, "║  See: ~/gt/docs/PRIMING.md (GUPP principle)                     ║")
 	fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
 	fmt.Fprintln(os.Stderr, "")
-	os.Exit(2) // Exit 2 = BLOCK in Claude Code hooks
-
-	return nil
+	return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
 }
 
 // isGasTownAgentContext returns true if we're running as a Gas Town managed agent.
