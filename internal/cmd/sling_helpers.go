@@ -187,6 +187,7 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	}
 
 	updateCmd := exec.Command("bd", "update", beadID, "--description="+newDesc)
+	updateCmd.Dir = resolveBeadDir(beadID)
 	updateCmd.Stderr = os.Stderr
 	if err := updateCmd.Run(); err != nil {
 		return fmt.Errorf("updating bead description: %w", err)

@@ -783,6 +783,7 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
 	// === MERGE SLOT GATE: Serialize conflict resolution ===
 	// Ensure merge slot exists (idempotent)
 	slotID, err := e.mergeSlotEnsureExists()
+	slotHolder := "" // tracks acquired slot for cleanup on error
 	if err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not ensure merge slot: %v\n", err)
 		// Continue anyway - slot is optional for now
@@ -803,7 +804,14 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
 			_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s will retry after current resolution completes\n", mr.ID)
 			return "", nil // Not an error - just deferred
 		} else {
+			slotHolder = holder
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Acquired merge slot: %s\n", slotID)
+		}
+	}
+	// Release slot on error to prevent permanent blockage
+	releaseSlotOnError := func() {
+		if slotHolder != "" {
+			_ = e.mergeSlotRelease(slotHolder)
 		}
 	}
 
@@ -870,6 +878,7 @@ The Refinery will automatically retry the merge after you force-push.`,
 		Actor:       e.rig.Name + "/refinery",
 	})
 	if err != nil {
+		releaseSlotOnError()
 		return "", fmt.Errorf("creating conflict resolution task: %w", err)
 	}
 

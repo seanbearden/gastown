@@ -587,9 +587,10 @@ func getCleanupStatus(workDir, rigName, polecatName string) string {
 	// Description format has "cleanup_status: <value>" line
 	for _, line := range strings.Split(issues[0].Description, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(strings.ToLower(line), "cleanup_status:") {
-			value := strings.TrimSpace(strings.TrimPrefix(line, "cleanup_status:"))
-			value = strings.TrimSpace(strings.TrimPrefix(value, "Cleanup_status:"))
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "cleanup_status:") {
+			// Use the lowercased version to ensure consistent prefix removal
+			value := strings.TrimSpace(strings.TrimPrefix(lower, "cleanup_status:"))
 			if value != "" && value != "null" {
 				return value
 			}
