@@ -115,6 +115,27 @@ func TestEnsureSettingsAt_CreatesDirectory(t *testing.T) {
 	}
 }
 
+func TestEnsureSettingsAt_UnwritableDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission checks are not reliable on Windows")
+	}
+
+	tmpDir := t.TempDir()
+	// Create a read-only directory to prevent file creation
+	readOnlyDir := filepath.Join(tmpDir, "readonly")
+	if err := os.MkdirAll(readOnlyDir, 0555); err != nil {
+		t.Fatalf("Failed to create read-only directory: %v", err)
+	}
+	t.Cleanup(func() {
+		os.Chmod(readOnlyDir, 0755) // restore so cleanup works
+	})
+
+	err := EnsureSettingsAt(readOnlyDir, ".copilot", "copilot-instructions.md")
+	if err == nil {
+		t.Error("EnsureSettingsAt() should return error for unwritable directory")
+	}
+}
+
 func TestEnsureSettingsAt_FilePermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("file mode checks are not reliable on Windows")

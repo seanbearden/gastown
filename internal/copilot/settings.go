@@ -24,6 +24,8 @@ func EnsureSettingsAt(workDir, hooksDir, hooksFile string) error {
 	settingsPath := filepath.Join(workDir, hooksDir, hooksFile)
 	if _, err := os.Stat(settingsPath); err == nil {
 		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking copilot instructions file: %w", err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0755); err != nil {

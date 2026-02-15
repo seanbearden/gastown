@@ -839,9 +839,9 @@ func TestCopilotAgentPreset(t *testing.T) {
 		t.Errorf("copilot ResumeStyle = %q, want flag", info.ResumeStyle)
 	}
 
-	// Check hooks support
-	if !info.SupportsHooks {
-		t.Error("copilot should support hooks")
+	// Check hooks support (false — instructions file is not executable hooks)
+	if info.SupportsHooks {
+		t.Error("copilot should not support hooks (instructions file is not executable)")
 	}
 
 	// Check fork session (not supported)
@@ -891,10 +891,18 @@ func TestCopilotProviderDefaults(t *testing.T) {
 		t.Errorf("defaultConfigDirEnv(copilot) = %q, want empty", configEnv)
 	}
 
-	// Test defaultHooksProvider
+	// Test defaultHooksProvider (copilot for provisioning, but informational-only)
 	provider := defaultHooksProvider("copilot")
 	if provider != "copilot" {
 		t.Errorf("defaultHooksProvider(copilot) = %q, want copilot", provider)
+	}
+
+	// Test defaultHooksInformational (copilot instructions are not executable hooks)
+	if !defaultHooksInformational("copilot") {
+		t.Error("defaultHooksInformational(copilot) should be true")
+	}
+	if defaultHooksInformational("claude") {
+		t.Error("defaultHooksInformational(claude) should be false")
 	}
 
 	// Test defaultHooksDir
@@ -921,16 +929,16 @@ func TestCopilotProviderDefaults(t *testing.T) {
 		t.Errorf("defaultReadyPromptPrefix(copilot) = %q, want \"❯ \"", prefix)
 	}
 
-	// Test defaultReadyDelayMs
+	// Test defaultReadyDelayMs (needs delay for startup fallback commands)
 	delay := defaultReadyDelayMs("copilot")
-	if delay != 0 {
-		t.Errorf("defaultReadyDelayMs(copilot) = %d, want 0", delay)
+	if delay != 5000 {
+		t.Errorf("defaultReadyDelayMs(copilot) = %d, want 5000", delay)
 	}
 
-	// Test defaultInstructionsFile
+	// Test defaultInstructionsFile (AGENTS.md like Codex/OpenCode, avoids hooks file conflict)
 	instFile := defaultInstructionsFile("copilot")
-	if instFile != "copilot-instructions.md" {
-		t.Errorf("defaultInstructionsFile(copilot) = %q, want copilot-instructions.md", instFile)
+	if instFile != "AGENTS.md" {
+		t.Errorf("defaultInstructionsFile(copilot) = %q, want AGENTS.md", instFile)
 	}
 }
 

@@ -419,7 +419,7 @@ type RuntimeSessionConfig struct {
 
 // RuntimeHooksConfig configures runtime hook installation.
 type RuntimeHooksConfig struct {
-	// Provider controls which hook templates to install: "claude", "opencode", or "none".
+	// Provider controls which hook templates to install: "claude", "opencode", "copilot", or "none".
 	Provider string `json:"provider,omitempty"`
 
 	// Dir is the settings directory (e.g., ".claude").
@@ -427,6 +427,12 @@ type RuntimeHooksConfig struct {
 
 	// SettingsFile is the settings file name (e.g., "settings.json").
 	SettingsFile string `json:"settings_file,omitempty"`
+
+	// Informational indicates the hooks provider installs instructions files only,
+	// not executable lifecycle hooks. When true, Gas Town sends startup fallback
+	// commands (gt prime) via nudge since hooks won't run automatically.
+	// Defaults to false (backwards compatible with claude/opencode which have real hooks).
+	Informational bool `json:"informational,omitempty"`
 }
 
 // RuntimeTmuxConfig controls tmux heuristics for detecting runtime readiness.
@@ -583,6 +589,13 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 		rc.Hooks.SettingsFile = defaultHooksFile(rc.Provider)
 	}
 
+	// Set informational flag for providers whose "hooks" are instructions files,
+	// not executable lifecycle hooks. This tells startup fallback logic to send
+	// gt prime via nudge since hooks won't run automatically.
+	if !rc.Hooks.Informational {
+		rc.Hooks.Informational = defaultHooksInformational(rc.Provider)
+	}
+
 	if rc.Tmux == nil {
 		rc.Tmux = &RuntimeTmuxConfig{}
 	}
@@ -729,6 +742,13 @@ func defaultHooksFile(provider string) string {
 	}
 }
 
+// defaultHooksInformational returns true for providers whose hooks are instructions
+// files only (not executable lifecycle hooks). For these providers, Gas Town sends
+// startup fallback commands (gt prime) via nudge since hooks won't auto-run.
+func defaultHooksInformational(provider string) bool {
+	return provider == "copilot"
+}
+
 func defaultProcessNames(provider, command string) []string {
 	if provider == "claude" {
 		return []string{"node"}
@@ -775,8 +795,9 @@ func defaultReadyDelayMs(provider string) int {
 		return 8000
 	}
 	if provider == "copilot" {
-		// Copilot CLI has prompt prefix detection via ❯, no delay needed.
-		return 0
+		// Copilot has prompt prefix detection via ❯ but needs a fallback delay
+		// for startup commands (gt prime) since it doesn't have executable hooks.
+		return 5000
 	}
 	return 0
 }
@@ -789,7 +810,7 @@ func defaultInstructionsFile(provider string) string {
 		return "AGENTS.md"
 	}
 	if provider == "copilot" {
-		return "copilot-instructions.md"
+		return "AGENTS.md"
 	}
 	return "CLAUDE.md"
 }

@@ -445,6 +445,72 @@ func TestStartupNudgeContent(t *testing.T) {
 	}
 }
 
+func TestEnsureSettingsForRole_CopilotUsesWorkDir(t *testing.T) {
+	// Copilot instructions must be installed in workDir (not settingsDir) because
+	// Copilot has no --settings equivalent for path redirection.
+	settingsDir := t.TempDir()
+	workDir := t.TempDir()
+
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider:     "copilot",
+			Dir:          ".copilot",
+			SettingsFile: "copilot-instructions.md",
+		},
+	}
+
+	err := EnsureSettingsForRole(settingsDir, workDir, "crew", rc)
+	if err != nil {
+		t.Fatalf("EnsureSettingsForRole() error = %v", err)
+	}
+
+	// Instructions should be in workDir, not settingsDir
+	if _, err := os.Stat(settingsDir + "/.copilot/copilot-instructions.md"); err == nil {
+		t.Error("Copilot instructions should NOT be in settingsDir")
+	}
+	if _, err := os.Stat(workDir + "/.copilot/copilot-instructions.md"); err != nil {
+		t.Error("Copilot instructions should be in workDir")
+	}
+}
+
+func TestGetStartupFallbackInfo_InformationalHooks(t *testing.T) {
+	// Copilot: hooks provider set but informational (instructions file, not executable).
+	// Should be treated as having NO hooks for startup fallback purposes.
+	rc := &config.RuntimeConfig{
+		PromptMode: "arg",
+		Hooks: &config.RuntimeHooksConfig{
+			Provider:      "copilot",
+			Informational: true,
+		},
+	}
+
+	info := GetStartupFallbackInfo(rc)
+	if !info.IncludePrimeInBeacon {
+		t.Error("Informational hooks should include prime instruction in beacon")
+	}
+	if !info.SendStartupNudge {
+		t.Error("Informational hooks should need startup nudge")
+	}
+	if info.SendBeaconNudge {
+		t.Error("Informational hooks with prompt should NOT need beacon nudge")
+	}
+}
+
+func TestStartupFallbackCommands_InformationalHooks(t *testing.T) {
+	// Copilot has hooks provider set but informational — should still get fallback commands.
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider:      "copilot",
+			Informational: true,
+		},
+	}
+
+	commands := StartupFallbackCommands("polecat", rc)
+	if commands == nil {
+		t.Error("StartupFallbackCommands() with informational hooks should return commands")
+	}
+}
+
 // Helper function
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && findSubstring(s, substr)

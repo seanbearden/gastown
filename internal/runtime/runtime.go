@@ -94,7 +94,7 @@ func StartupFallbackCommands(role string, rc *config.RuntimeConfig) []string {
 	if rc == nil {
 		rc = config.DefaultRuntimeConfig()
 	}
-	if rc.Hooks != nil && rc.Hooks.Provider != "" && rc.Hooks.Provider != "none" {
+	if rc.Hooks != nil && rc.Hooks.Provider != "" && rc.Hooks.Provider != "none" && !rc.Hooks.Informational {
 		return nil
 	}
 
@@ -176,7 +176,7 @@ func GetStartupFallbackInfo(rc *config.RuntimeConfig) *StartupFallbackInfo {
 		rc = config.DefaultRuntimeConfig()
 	}
 
-	hasHooks := rc.Hooks != nil && rc.Hooks.Provider != "" && rc.Hooks.Provider != "none"
+	hasHooks := rc.Hooks != nil && rc.Hooks.Provider != "" && rc.Hooks.Provider != "none" && !rc.Hooks.Informational
 	hasPrompt := rc.PromptMode != "none"
 
 	info := &StartupFallbackInfo{}

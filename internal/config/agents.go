@@ -213,7 +213,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		SessionIDEnv:        "",                   // Session IDs stored on disk, not in env
 		ResumeFlag:          "--resume",
 		ResumeStyle:         "flag",
-		SupportsHooks:       true,  // Copilot supports MCP and plugins
+		SupportsHooks:       false, // Copilot instructions file is not executable hooks
 		SupportsForkSession: false,
 		NonInteractive: &NonInteractiveConfig{
 			PromptFlag: "-p",
