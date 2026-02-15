@@ -803,16 +803,11 @@ func defaultReadyDelayMs(provider string) int {
 }
 
 func defaultInstructionsFile(provider string) string {
-	if provider == "codex" {
-		return "AGENTS.md"
+	// Claude uses CLAUDE.md; all other agents use AGENTS.md.
+	if provider == "claude" {
+		return "CLAUDE.md"
 	}
-	if provider == "opencode" {
-		return "AGENTS.md"
-	}
-	if provider == "copilot" {
-		return "AGENTS.md"
-	}
-	return "CLAUDE.md"
+	return "AGENTS.md"
 }
 
 // quoteForShell quotes a string for safe shell usage.
