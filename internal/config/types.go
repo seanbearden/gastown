@@ -616,6 +616,8 @@ func defaultRuntimeCommand(provider string) string {
 		return "codex"
 	case "opencode":
 		return "opencode"
+	case "copilot":
+		return "copilot"
 	case "generic":
 		return ""
 	default:
@@ -652,6 +654,8 @@ func defaultRuntimeArgs(provider string) []string {
 	switch provider {
 	case "claude":
 		return []string{"--dangerously-skip-permissions"}
+	case "copilot":
+		return []string{"--yolo"}
 	default:
 		return nil
 	}
@@ -663,6 +667,8 @@ func defaultPromptMode(provider string) string {
 		return "none"
 	case "opencode":
 		return "none"
+	case "copilot":
+		return "prompt"
 	default:
 		return "arg"
 	}
@@ -688,6 +694,8 @@ func defaultHooksProvider(provider string) string {
 		return "claude"
 	case "opencode":
 		return "opencode"
+	case "copilot":
+		return "copilot"
 	default:
 		return "none"
 	}
@@ -699,6 +707,8 @@ func defaultHooksDir(provider string) string {
 		return ".claude"
 	case "opencode":
 		return ".opencode/plugin"
+	case "copilot":
+		return ".copilot"
 	default:
 		return ""
 	}
@@ -712,6 +722,8 @@ func defaultHooksFile(provider string) string {
 		return "settings.json"
 	case "opencode":
 		return "gastown.js"
+	case "copilot":
+		return "copilot-instructions.md"
 	default:
 		return ""
 	}
@@ -726,6 +738,11 @@ func defaultProcessNames(provider, command string) []string {
 		// tmux pane_current_command may show "node" or "opencode" depending on how invoked.
 		return []string{"opencode", "node"}
 	}
+	if provider == "copilot" {
+		// Copilot CLI reports as "copilot" in tmux pane_current_command
+		// despite being a Node.js application.
+		return []string{"copilot"}
+	}
 	if command != "" {
 		return []string{filepath.Base(command)}
 	}
@@ -735,6 +752,10 @@ func defaultProcessNames(provider, command string) []string {
 func defaultReadyPromptPrefix(provider string) string {
 	if provider == "claude" {
 		// Claude Code uses ❯ (U+276F) as the prompt character
+		return "❯ "
+	}
+	if provider == "copilot" {
+		// Copilot CLI also uses ❯ (U+276F) as the prompt character
 		return "❯ "
 	}
 	return ""
@@ -753,6 +774,10 @@ func defaultReadyDelayMs(provider string) int {
 		// 8000ms provides reliable startup detection across models.
 		return 8000
 	}
+	if provider == "copilot" {
+		// Copilot CLI has prompt prefix detection via ❯, no delay needed.
+		return 0
+	}
 	return 0
 }
 
@@ -762,6 +787,9 @@ func defaultInstructionsFile(provider string) string {
 	}
 	if provider == "opencode" {
 		return "AGENTS.md"
+	}
+	if provider == "copilot" {
+		return "copilot-instructions.md"
 	}
 	return "CLAUDE.md"
 }
