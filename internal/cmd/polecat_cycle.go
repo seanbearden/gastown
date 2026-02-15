@@ -73,7 +73,7 @@ func cyclePolecatSession(direction int, sessionOverride string) error {
 	targetSession := sessions[targetIdx]
 
 	// Switch to target session
-	cmd := exec.Command("tmux", "switch-client", "-t", targetSession)
+	cmd := exec.Command("tmux", "-u", "switch-client", "-t", targetSession)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("switching to %s: %w", targetSession, err)
 	}

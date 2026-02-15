@@ -751,7 +751,7 @@ func handoffRemoteSession(t *tmux.Tmux, targetSession, restartCmd string) error 
 	if handoffWatch {
 		fmt.Printf("Switching to %s...\n", targetSession)
 		// Use tmux switch-client to move our view to the target session
-		if err := exec.Command("tmux", "switch-client", "-t", targetSession).Run(); err != nil {
+		if err := exec.Command("tmux", "-u", "switch-client", "-t", targetSession).Run(); err != nil {
 			// Non-fatal - they can manually switch
 			fmt.Printf("Note: Could not auto-switch (use: tmux switch-client -t %s)\n", targetSession)
 		}

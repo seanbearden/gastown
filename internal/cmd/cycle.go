@@ -182,7 +182,7 @@ func cycleRigInfraSession(direction int, currentSession, rig string) error {
 	}
 
 	// Switch to target session
-	cmd := exec.Command("tmux", "switch-client", "-t", sessions[targetIdx])
+	cmd := exec.Command("tmux", "-u", "switch-client", "-t", sessions[targetIdx])
 	return cmd.Run()
 }
 
