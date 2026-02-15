@@ -627,6 +627,8 @@ func defaultRuntimeCommand(provider string) string {
 	switch provider {
 	case "codex":
 		return "codex"
+	case "gemini":
+		return "gemini"
 	case "opencode":
 		return "opencode"
 	case "copilot":
@@ -688,10 +690,14 @@ func defaultPromptMode(provider string) string {
 }
 
 func defaultSessionIDEnv(provider string) string {
-	if provider == "claude" {
+	switch provider {
+	case "claude":
 		return "CLAUDE_SESSION_ID"
+	case "gemini":
+		return "GEMINI_SESSION_ID"
+	default:
+		return ""
 	}
-	return ""
 }
 
 func defaultConfigDirEnv(provider string) string {
@@ -705,6 +711,8 @@ func defaultHooksProvider(provider string) string {
 	switch provider {
 	case "claude":
 		return "claude"
+	case "gemini":
+		return "gemini"
 	case "opencode":
 		return "opencode"
 	case "copilot":
@@ -718,6 +726,8 @@ func defaultHooksDir(provider string) string {
 	switch provider {
 	case "claude":
 		return ".claude"
+	case "gemini":
+		return ".gemini"
 	case "opencode":
 		return ".opencode/plugin"
 	case "copilot":
@@ -732,6 +742,8 @@ func defaultHooksFile(provider string) string {
 	case "claude":
 		// Use settings.json installed via --settings flag in a gastown-managed
 		// parent directory, keeping customer repos untouched.
+		return "settings.json"
+	case "gemini":
 		return "settings.json"
 	case "opencode":
 		return "gastown.js"
@@ -752,6 +764,9 @@ func defaultHooksInformational(provider string) bool {
 func defaultProcessNames(provider, command string) []string {
 	if provider == "claude" {
 		return []string{"node"}
+	}
+	if provider == "gemini" {
+		return []string{"gemini"}
 	}
 	if provider == "opencode" {
 		// OpenCode runs as Node.js process, need both for IsAgentRunning detection.
@@ -784,6 +799,10 @@ func defaultReadyPromptPrefix(provider string) string {
 func defaultReadyDelayMs(provider string) int {
 	if provider == "claude" {
 		return 10000
+	}
+	if provider == "gemini" {
+		// Estimated delay — needs tuning after real Gemini CLI testing.
+		return 5000
 	}
 	if provider == "codex" {
 		return 3000
