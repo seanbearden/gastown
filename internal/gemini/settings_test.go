@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -263,6 +264,200 @@ func TestEnsureSettingsAt_GeminiHookEvents(t *testing.T) {
 		if containsStr(contentStr, event) {
 			t.Errorf("Settings should NOT contain Claude hook event %q", event)
 		}
+	}
+}
+
+func TestEmbeddedTemplates_ValidJSON(t *testing.T) {
+	t.Parallel()
+
+	templates := []string{
+		"config/settings-autonomous.json",
+		"config/settings-interactive.json",
+	}
+
+	for _, tmpl := range templates {
+		t.Run(tmpl, func(t *testing.T) {
+			content, err := configFS.ReadFile(tmpl)
+			if err != nil {
+				t.Fatalf("Failed to read embedded template %s: %v", tmpl, err)
+			}
+
+			if len(content) == 0 {
+				t.Fatalf("Embedded template %s is empty", tmpl)
+			}
+
+			// Verify valid JSON
+			var parsed map[string]interface{}
+			if err := json.Unmarshal(content, &parsed); err != nil {
+				t.Fatalf("Embedded template %s is not valid JSON: %v", tmpl, err)
+			}
+
+			// Verify it has a hooks section
+			if _, ok := parsed["hooks"]; !ok {
+				t.Errorf("Template %s missing 'hooks' key", tmpl)
+			}
+		})
+	}
+}
+
+func TestAutonomousTemplate_MailInjectInSessionStart(t *testing.T) {
+	content, err := configFS.ReadFile("config/settings-autonomous.json")
+	if err != nil {
+		t.Fatalf("Failed to read autonomous template: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(content, &parsed); err != nil {
+		t.Fatalf("Invalid JSON: %v", err)
+	}
+
+	hooks, ok := parsed["hooks"].(map[string]interface{})
+	if !ok {
+		t.Fatal("hooks is not a map")
+	}
+
+	sessionStart, ok := hooks["SessionStart"]
+	if !ok {
+		t.Fatal("Missing SessionStart in hooks")
+	}
+
+	// Verify at least one SessionStart hook command contains mail inject
+	entries, ok := sessionStart.([]interface{})
+	if !ok {
+		t.Fatal("SessionStart is not an array")
+	}
+
+	found := false
+	for _, entry := range entries {
+		entryMap, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		hookActions, ok := entryMap["hooks"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, action := range hookActions {
+			actionMap, ok := action.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			cmd, _ := actionMap["command"].(string)
+			if containsStr(cmd, "gt mail check --inject") {
+				found = true
+			}
+		}
+	}
+
+	if !found {
+		t.Error("Autonomous template SessionStart must include 'gt mail check --inject'")
+	}
+}
+
+func TestInteractiveTemplate_NoMailInjectInSessionStart(t *testing.T) {
+	content, err := configFS.ReadFile("config/settings-interactive.json")
+	if err != nil {
+		t.Fatalf("Failed to read interactive template: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(content, &parsed); err != nil {
+		t.Fatalf("Invalid JSON: %v", err)
+	}
+
+	hooks, ok := parsed["hooks"].(map[string]interface{})
+	if !ok {
+		t.Fatal("hooks is not a map")
+	}
+
+	sessionStart, ok := hooks["SessionStart"]
+	if !ok {
+		t.Fatal("Missing SessionStart in hooks")
+	}
+
+	entries, ok := sessionStart.([]interface{})
+	if !ok {
+		t.Fatal("SessionStart is not an array")
+	}
+
+	for _, entry := range entries {
+		entryMap, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		hookActions, ok := entryMap["hooks"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, action := range hookActions {
+			actionMap, ok := action.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			cmd, _ := actionMap["command"].(string)
+			if containsStr(cmd, "gt mail check --inject") {
+				t.Error("Interactive template SessionStart must NOT include 'gt mail check --inject'")
+			}
+		}
+	}
+}
+
+func TestAllTemplates_SessionStartHasHookFlag(t *testing.T) {
+	t.Parallel()
+
+	templates := []string{
+		"config/settings-autonomous.json",
+		"config/settings-interactive.json",
+	}
+
+	for _, tmpl := range templates {
+		t.Run(tmpl, func(t *testing.T) {
+			content, err := configFS.ReadFile(tmpl)
+			if err != nil {
+				t.Fatalf("Failed to read template: %v", err)
+			}
+
+			var parsed map[string]interface{}
+			if err := json.Unmarshal(content, &parsed); err != nil {
+				t.Fatalf("Invalid JSON: %v", err)
+			}
+
+			hooks, ok := parsed["hooks"].(map[string]interface{})
+			if !ok {
+				t.Fatal("hooks is not a map")
+			}
+
+			sessionStart, ok := hooks["SessionStart"]
+			if !ok {
+				t.Fatal("Missing SessionStart in hooks")
+			}
+
+			entries, ok := sessionStart.([]interface{})
+			if !ok {
+				t.Fatal("SessionStart is not an array")
+			}
+
+			for _, entry := range entries {
+				entryMap, ok := entry.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				hookActions, ok := entryMap["hooks"].([]interface{})
+				if !ok {
+					continue
+				}
+				for _, action := range hookActions {
+					actionMap, ok := action.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					cmd, _ := actionMap["command"].(string)
+					if containsStr(cmd, "gt prime") && !containsStr(cmd, "--hook") {
+						t.Errorf("SessionStart hook with 'gt prime' must include '--hook' flag: %s", cmd)
+					}
+				}
+			}
+		})
 	}
 }
 
