@@ -21,7 +21,7 @@ type PR struct {
 type CheckRun struct {
 	Name       string `json:"name"`
 	Status     string `json:"status"`     // "completed", "in_progress", "queued", etc.
-	Conclusion string `json:"conclusion"` // "success", "failure", "cancelled", "timed_out", etc.
+	Conclusion string `json:"conclusion"` // "success", "failure", "canceled", "timed_out", etc.
 	URL        string `json:"link"`
 }
 
@@ -116,7 +116,7 @@ func GetCheckRuns(repo string, prNumber int) ([]CheckRun, error) {
 // IsFailed returns true if the check run has a failure conclusion.
 func (c CheckRun) IsFailed() bool {
 	switch c.Conclusion {
-	case "failure", "timed_out", "cancelled", "action_required":
+	case "failure", "timed_out", "canceled", "action_required":
 		return true
 	default:
 		return false

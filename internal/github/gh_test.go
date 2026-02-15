@@ -68,7 +68,7 @@ func TestCheckRun_IsFailed(t *testing.T) {
 	}{
 		{"failure", true},
 		{"timed_out", true},
-		{"cancelled", true},
+		{"canceled", true},
 		{"action_required", true},
 		{"success", false},
 		{"neutral", false},
