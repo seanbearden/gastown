@@ -5,7 +5,7 @@
 
 codecov:
   branch: main
-  max_report_age: "12h"
+  max_report_age: off
   notify:
     after_n_builds: 1
     wait_for_ci: true
