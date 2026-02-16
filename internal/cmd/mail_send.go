@@ -3,18 +3,27 @@ package cmd
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+// mailNudgeIdleTimeout is the maximum time to wait for a recipient's session to
+// become idle before falling back to a queued nudge. Kept as a var (not const)
+// so tests can shorten it.
+var mailNudgeIdleTimeout = 1 * time.Second
 
 func runMailSend(cmd *cobra.Command, args []string) error {
 	// Handle --stdin: read message body from stdin (avoids shell quoting issues)
@@ -96,6 +105,12 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	// Set CC recipients
 	msg.CC = mailCC
 
+	// When the CLI handles notification itself, suppress the router's built-in
+	// queue-only notification to avoid double-notifying.
+	if !mailNoNotify {
+		msg.SuppressNotify = true
+	}
+
 	// Handle reply-to: auto-set type to reply and look up thread
 	if mailReplyTo != "" {
 		msg.ReplyTo = mailReplyTo
@@ -140,6 +155,11 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		_ = events.LogFeed(events.TypeMail, from, events.MailPayload(to, mailSubject))
 		fmt.Printf("%s Message sent to %s\n", style.Bold.Render("✓"), to)
 		fmt.Printf("  Subject: %s\n", mailSubject)
+
+		// CLI-side notification for legacy path
+		if !mailNoNotify {
+			notifyRecipients(townRoot, from, mailSubject, []string{to}, router)
+		}
 		return nil
 	}
 
@@ -206,7 +226,79 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Type: %s\n", msg.Type)
 	}
 
+	// CLI-side notification: idle → immediate nudge, busy → queued nudge
+	if !mailNoNotify {
+		notifyRecipients(townRoot, from, mailSubject, recipientAddrs, router)
+	}
+
 	return nil
+}
+
+// notifyRecipients sends notifications to each recipient address.
+// For idle sessions it sends an immediate nudge via tmux; for busy sessions
+// it enqueues a nudge for cooperative delivery at the next turn boundary.
+func notifyRecipients(townRoot, from, subject string, addrs []string, router *mail.Router) {
+	t := tmux.NewTmux()
+	fromIdentity := mail.AddressToIdentity(from)
+	notification := fmt.Sprintf(
+		"📬 You have new mail from %s. Subject: %s. Run 'gt mail inbox' to read.",
+		from, subject,
+	)
+
+	for _, addr := range addrs {
+		// Skip self-mail
+		if mail.AddressToIdentity(addr) == fromIdentity {
+			continue
+		}
+
+		// Skip DND/muted recipients
+		if router.IsRecipientMuted(addr) {
+			continue
+		}
+
+		sessionIDs := mail.AddressToSessionIDs(addr)
+		if len(sessionIDs) == 0 {
+			continue
+		}
+
+		notified := false
+		for _, sessionID := range sessionIDs {
+			hasSession, err := t.HasSession(sessionID)
+			if err != nil {
+				if errors.Is(err, tmux.ErrSessionNotFound) || errors.Is(err, tmux.ErrNoServer) {
+					continue
+				}
+				continue
+			}
+			if !hasSession {
+				continue
+			}
+
+			// Session exists — check if idle
+			if err := t.WaitForIdle(sessionID, mailNudgeIdleTimeout); err == nil {
+				// Idle → send immediate nudge
+				if err := t.NudgeSession(sessionID, notification); err == nil {
+					fmt.Printf("  ↳ Nudged idle recipient %s\n", addr)
+					notified = true
+					break
+				}
+			}
+
+			// Busy or nudge failed → enqueue for cooperative delivery
+			if townRoot != "" {
+				_ = nudge.Enqueue(townRoot, sessionID, nudge.QueuedNudge{
+					Sender:  from,
+					Message: notification,
+				})
+				fmt.Printf("  ↳ Queued notification for %s\n", addr)
+				notified = true
+				break
+			}
+		}
+
+		// If no session found at all, skip silently (agent is offline)
+		_ = notified
+	}
 }
 
 // generateThreadID creates a random thread ID for new message threads.
