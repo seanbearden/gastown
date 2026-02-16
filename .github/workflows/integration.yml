@@ -34,7 +34,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/go/bin/bd
-          key: beads-v0.50.2
+          key: beads-${{ hashFiles('.github/workflows/integration.yml') }}
 
       - name: Install beads (bd)
         if: steps.cache-beads.outputs.cache-hit != 'true'
