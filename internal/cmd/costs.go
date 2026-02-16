@@ -633,8 +633,20 @@ func queryDigestBeads(days int) ([]CostEntry, error) {
 			continue
 		}
 
-		// Extract individual session entries from the digest
-		entries = append(entries, digest.Sessions...)
+		// If the digest has per-session data (old format), use it directly.
+		// Otherwise, synthesize entries from the aggregate ByRole data.
+		if len(digest.Sessions) > 0 {
+			entries = append(entries, digest.Sessions...)
+		} else {
+			for role, cost := range digest.ByRole {
+				entries = append(entries, CostEntry{
+					SessionID: fmt.Sprintf("digest-%s-%s", digest.Date, role),
+					Role:      role,
+					CostUSD:   cost,
+					EndedAt:   digestDate,
+				})
+			}
+		}
 	}
 
 	return entries, nil
@@ -1110,7 +1122,17 @@ type CostDigest struct {
 	Date         string             `json:"date"`
 	TotalUSD     float64            `json:"total_usd"`
 	SessionCount int                `json:"session_count"`
-	Sessions     []CostEntry        `json:"sessions"`
+	Sessions     []CostEntry        `json:"sessions,omitempty"`
+	ByRole       map[string]float64 `json:"by_role"`
+	ByRig        map[string]float64 `json:"by_rig,omitempty"`
+}
+
+// CostDigestPayload is the compact payload stored in the bead.
+// It excludes per-session details to avoid exceeding Dolt column size limits.
+type CostDigestPayload struct {
+	Date         string             `json:"date"`
+	TotalUSD     float64            `json:"total_usd"`
+	SessionCount int                `json:"session_count"`
 	ByRole       map[string]float64 `json:"by_role"`
 	ByRig        map[string]float64 `json:"by_rig,omitempty"`
 }
@@ -1285,8 +1307,16 @@ func createCostDigestBead(digest CostDigest) (string, error) {
 		desc.WriteString("\n")
 	}
 
-	// Build payload JSON with full session details
-	payloadJSON, err := json.Marshal(digest)
+	// Build compact payload (aggregate only, no per-session details).
+	// Per-session details can be thousands of records and exceed Dolt column limits.
+	compactPayload := CostDigestPayload{
+		Date:         digest.Date,
+		TotalUSD:     digest.TotalUSD,
+		SessionCount: digest.SessionCount,
+		ByRole:       digest.ByRole,
+		ByRig:        digest.ByRig,
+	}
+	payloadJSON, err := json.Marshal(compactPayload)
 	if err != nil {
 		return "", fmt.Errorf("marshaling digest payload: %w", err)
 	}
