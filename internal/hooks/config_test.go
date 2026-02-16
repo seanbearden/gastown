@@ -424,14 +424,26 @@ func TestComputeExpectedNoBase(t *testing.T) {
 	tmpDir := t.TempDir()
 	setTestHome(t, tmpDir)
 
+	// Mayor target: DefaultBase + built-in mayor override (task-dispatch guard)
 	expected, err := ComputeExpected("mayor")
 	if err != nil {
 		t.Fatalf("ComputeExpected failed: %v", err)
 	}
 
 	defaultBase := DefaultBase()
-	if !HooksEqual(expected, defaultBase) {
-		t.Error("expected DefaultBase when no configs exist")
+	mayorDefaults := DefaultOverrides()["mayor"]
+	merged := Merge(defaultBase, mayorDefaults)
+	if !HooksEqual(expected, merged) {
+		t.Error("expected DefaultBase + mayor default override when no configs exist")
+	}
+
+	// Non-mayor target with no built-in override: should equal DefaultBase
+	crew, err := ComputeExpected("crew")
+	if err != nil {
+		t.Fatalf("ComputeExpected(crew) failed: %v", err)
+	}
+	if !HooksEqual(crew, defaultBase) {
+		t.Error("expected DefaultBase for crew when no configs exist")
 	}
 }
 

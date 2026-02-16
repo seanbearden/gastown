@@ -177,11 +177,16 @@ func ComputeExpected(target string) (*HooksConfig, error) {
 		}
 	}
 
+	defaults := DefaultOverrides()
 	result := base
 	for _, overrideKey := range GetApplicableOverrides(target) {
 		override, err := LoadOverride(overrideKey)
 		if err != nil {
 			if os.IsNotExist(err) {
+				// No on-disk override; apply built-in default if one exists
+				if def, ok := defaults[overrideKey]; ok {
+					result = Merge(result, def)
+				}
 				continue
 			}
 			return nil, fmt.Errorf("loading override %q: %w", overrideKey, err)
@@ -526,6 +531,27 @@ func DefaultBase() *HooksConfig {
 						Type:    "command",
 						Command: fmt.Sprintf("%s && gt costs record", pathSetup),
 					},
+				},
+			},
+		},
+	}
+}
+
+// DefaultOverrides returns built-in override configs for specific roles.
+// These are applied when no on-disk override exists for the role,
+// providing sensible defaults that gt hooks sync will propagate.
+func DefaultOverrides() map[string]*HooksConfig {
+	pathSetup := `export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"`
+
+	return map[string]*HooksConfig{
+		"mayor": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Task",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: fmt.Sprintf("%s && gt tap guard task-dispatch", pathSetup),
+					}},
 				},
 			},
 		},
