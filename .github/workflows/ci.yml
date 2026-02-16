@@ -234,7 +234,15 @@ jobs:
           git config --global user.name "CI Bot"
           git config --global user.email "ci@gastown.test"
 
+      - name: Cache beads (bd)
+        id: cache-beads-int
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin/bd
+          key: beads-v0.50.2
+
       - name: Install beads (bd)
+        if: steps.cache-beads-int.outputs.cache-hit != 'true'
         run: go install github.com/steveyegge/beads/cmd/bd@v0.50.2
 
       - name: Build gt
