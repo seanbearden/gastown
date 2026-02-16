@@ -488,6 +488,73 @@ func TestComputeExpectedBuiltinPlusOnDisk(t *testing.T) {
 	}
 }
 
+// TestComputeExpectedOnDiskReplacesBuiltin verifies that an on-disk override
+// with a conflicting "Task" matcher replaces the built-in guard command.
+func TestComputeExpectedOnDiskReplacesBuiltin(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	// On-disk override replaces the Task matcher with a custom command
+	customOverride := &HooksConfig{
+		PreToolUse: []HookEntry{
+			{Matcher: "Task", Hooks: []Hook{{Type: "command", Command: "custom-task-guard"}}},
+		},
+	}
+	if err := SaveOverride("mayor", customOverride); err != nil {
+		t.Fatalf("SaveOverride failed: %v", err)
+	}
+
+	expected, err := ComputeExpected("mayor")
+	if err != nil {
+		t.Fatalf("ComputeExpected failed: %v", err)
+	}
+
+	// The on-disk Task entry should replace the built-in one
+	foundCustom := false
+	for _, entry := range expected.PreToolUse {
+		if entry.Matcher == "Task" {
+			if len(entry.Hooks) == 1 && entry.Hooks[0].Command == "custom-task-guard" {
+				foundCustom = true
+			} else {
+				t.Errorf("Task matcher should have custom command, got %v", entry.Hooks)
+			}
+			break
+		}
+	}
+	if !foundCustom {
+		t.Error("on-disk Task override should replace built-in guard")
+	}
+}
+
+// TestComputeExpectedOnDiskDisablesBuiltin verifies that an on-disk override
+// with an empty Hooks list for "Task" disables the built-in guard entirely.
+func TestComputeExpectedOnDiskDisablesBuiltin(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	// On-disk override disables the Task guard with empty hooks
+	disableOverride := &HooksConfig{
+		PreToolUse: []HookEntry{
+			{Matcher: "Task", Hooks: []Hook{}},
+		},
+	}
+	if err := SaveOverride("mayor", disableOverride); err != nil {
+		t.Fatalf("SaveOverride failed: %v", err)
+	}
+
+	expected, err := ComputeExpected("mayor")
+	if err != nil {
+		t.Fatalf("ComputeExpected failed: %v", err)
+	}
+
+	// The Task entry should be removed (empty Hooks = explicit disable)
+	for _, entry := range expected.PreToolUse {
+		if entry.Matcher == "Task" {
+			t.Error("Task matcher should be removed when on-disk override has empty Hooks")
+		}
+	}
+}
+
 func TestHooksEqual(t *testing.T) {
 	a := &HooksConfig{
 		SessionStart: []HookEntry{

@@ -188,8 +188,9 @@ func DefaultOverrides() map[string]*HooksConfig {
 // If no base config exists, uses DefaultBase().
 //
 // For each override key, built-in defaults (from DefaultOverrides) are merged
-// first, then on-disk overrides layer on top. This ensures built-in guards
-// remain active even when custom on-disk overrides exist for the same role.
+// first, then on-disk overrides layer on top. On-disk overrides can replace
+// or disable built-in guards by providing a matching PreToolUse entry (e.g.,
+// an empty Hooks list for the "Task" matcher disables the task-dispatch guard).
 func ComputeExpected(target string) (*HooksConfig, error) {
 	base, err := LoadBase()
 	if err != nil {
