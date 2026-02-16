@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -13,6 +14,91 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 )
+
+// installMockBd places a fake bd binary in PATH that handles the commands
+// needed by AddWithOptions (init, create, show, config, update, slot, etc.).
+// This allows polecat tests to run without a real bd installation.
+//
+// On Windows, uses a .cmd→PowerShell wrapper (batch echo mangles JSON quotes).
+// Pattern borrowed from internal/cmd/rig_integration_test.go:mockBdCommand.
+func installMockBd(t *testing.T) {
+	t.Helper()
+	binDir := t.TempDir()
+
+	if runtime.GOOS == "windows" {
+		psPath := filepath.Join(binDir, "bd.ps1")
+		psScript := `# Mock bd for polecat tests (PowerShell)
+$cmd = ''
+foreach ($arg in $args) {
+  if ($arg -like '--*') { continue }
+  $cmd = $arg
+  break
+}
+switch ($cmd) {
+  'init'   { exit 0 }
+  'config' { exit 0 }
+  'create' {
+    $beadId = 'mock-1'
+    foreach ($arg in $args) {
+      if ($arg -like '--id=*') { $beadId = $arg.Substring(5) }
+    }
+    Write-Output ("{""id"":""" + $beadId + """,""status"":""open"",""created_at"":""2025-01-01T00:00:00Z""}")
+    exit 0
+  }
+  'show' {
+    Write-Error '{"error":"not found"}'
+    exit 1
+  }
+  default { exit 0 }
+}
+`
+		cmdScript := "@echo off\r\npwsh -NoProfile -NoLogo -File \"" + psPath + "\" %*\r\n"
+		if err := os.WriteFile(psPath, []byte(psScript), 0644); err != nil {
+			t.Fatalf("write mock bd.ps1: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(binDir, "bd.cmd"), []byte(cmdScript), 0644); err != nil {
+			t.Fatalf("write mock bd.cmd: %v", err)
+		}
+	} else {
+		script := `#!/bin/sh
+# Mock bd for polecat tests.
+# Find the actual command (skip global flags like --allow-stale).
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;; # skip flags
+    *) cmd="$arg"; break ;;
+  esac
+done
+case "$cmd" in
+  init|config|update|slot|reopen|migrate)
+    exit 0
+    ;;
+  create)
+    bead_id="mock-1"
+    for arg in "$@"; do
+      case "$arg" in
+        --id=*) bead_id="${arg#--id=}" ;;
+      esac
+    done
+    echo "{\"id\":\"$bead_id\",\"status\":\"open\",\"created_at\":\"2025-01-01T00:00:00Z\"}"
+    exit 0
+    ;;
+  show)
+    echo '{"error":"not found"}' >&2
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+		if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+			t.Fatalf("write mock bd: %v", err)
+		}
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
 
 func TestStateIsActive(t *testing.T) {
 	tests := []struct {
@@ -766,10 +852,18 @@ func TestAddWithOptions_NoPrimeMDCreatedLocally(t *testing.T) {
 		t.Fatalf("write rig redirect: %v", err)
 	}
 
-	// Initialize beads database so agent bead creation works
-	bd := beads.NewWithBeadsDir(mayorRig, mayorBeads)
-	if err := bd.Init("gt"); err != nil {
-		t.Fatalf("bd init: %v", err)
+	// Initialize beads database so agent bead creation works.
+	// Use real bd if available; fall back to a mock for environments (like
+	// Windows CI) where bd is not installed.
+	if _, err := exec.LookPath("bd"); err == nil {
+		bd := beads.NewWithBeadsDir(mayorRig, mayorBeads)
+		if err := bd.Init("gt"); err != nil {
+			t.Fatalf("bd init: %v", err)
+		}
+	} else {
+		installMockBd(t)
+		// Write the custom-types sentinel so EnsureCustomTypes is a no-op.
+		_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte("v1\n"), 0644)
 	}
 
 	// Initialize git repo in mayor/rig WITHOUT any .beads/PRIME.md
@@ -870,10 +964,18 @@ func TestAddWithOptions_NoFilesAddedToRepo(t *testing.T) {
 		t.Fatalf("write rig redirect: %v", err)
 	}
 
-	// Initialize beads database so agent bead creation works
-	bd := beads.NewWithBeadsDir(mayorRig, mayorBeads)
-	if err := bd.Init("gt"); err != nil {
-		t.Fatalf("bd init: %v", err)
+	// Initialize beads database so agent bead creation works.
+	// Use real bd if available; fall back to a mock for environments (like
+	// Windows CI) where bd is not installed.
+	if _, err := exec.LookPath("bd"); err == nil {
+		bd := beads.NewWithBeadsDir(mayorRig, mayorBeads)
+		if err := bd.Init("gt"); err != nil {
+			t.Fatalf("bd init: %v", err)
+		}
+	} else {
+		installMockBd(t)
+		// Write the custom-types sentinel so EnsureCustomTypes is a no-op.
+		_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte("v1\n"), 0644)
 	}
 
 	// Initialize a CLEAN git repo with known files only
@@ -1006,10 +1108,18 @@ func TestAddWithOptions_SettingsInstalledInPolecatsDir(t *testing.T) {
 		t.Fatalf("write rig redirect: %v", err)
 	}
 
-	// Initialize beads database so agent bead creation works
-	bd := beads.NewWithBeadsDir(mayorRig, mayorBeads)
-	if err := bd.Init("gt"); err != nil {
-		t.Fatalf("bd init: %v", err)
+	// Initialize beads database so agent bead creation works.
+	// Use real bd if available; fall back to a mock for environments (like
+	// Windows CI) where bd is not installed.
+	if _, err := exec.LookPath("bd"); err == nil {
+		bd := beads.NewWithBeadsDir(mayorRig, mayorBeads)
+		if err := bd.Init("gt"); err != nil {
+			t.Fatalf("bd init: %v", err)
+		}
+	} else {
+		installMockBd(t)
+		// Write the custom-types sentinel so EnsureCustomTypes is a no-op.
+		_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte("v1\n"), 0644)
 	}
 
 	// Initialize a git repo
