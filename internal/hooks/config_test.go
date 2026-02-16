@@ -424,14 +424,67 @@ func TestComputeExpectedNoBase(t *testing.T) {
 	tmpDir := t.TempDir()
 	setTestHome(t, tmpDir)
 
+	// Mayor should get DefaultBase + built-in mayor override (task-dispatch guard)
 	expected, err := ComputeExpected("mayor")
 	if err != nil {
 		t.Fatalf("ComputeExpected failed: %v", err)
 	}
 
 	defaultBase := DefaultBase()
-	if !HooksEqual(expected, defaultBase) {
-		t.Error("expected DefaultBase when no configs exist")
+	mayorDefaults := DefaultOverrides()["mayor"]
+	merged := Merge(defaultBase, mayorDefaults)
+	if !HooksEqual(expected, merged) {
+		t.Error("expected DefaultBase + mayor default override when no configs exist")
+	}
+
+	// Non-mayor target should still just get DefaultBase
+	crew, err := ComputeExpected("crew")
+	if err != nil {
+		t.Fatalf("ComputeExpected(crew) failed: %v", err)
+	}
+	if !HooksEqual(crew, defaultBase) {
+		t.Error("expected DefaultBase for crew when no configs exist")
+	}
+}
+
+// TestComputeExpectedBuiltinPlusOnDisk verifies that on-disk overrides layer
+// on top of built-in defaults rather than replacing them.
+func TestComputeExpectedBuiltinPlusOnDisk(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	// Save an on-disk mayor override that adds a custom SessionStart hook
+	customOverride := &HooksConfig{
+		SessionStart: []HookEntry{
+			{Matcher: "", Hooks: []Hook{{Type: "command", Command: "custom-mayor-session"}}},
+		},
+	}
+	if err := SaveOverride("mayor", customOverride); err != nil {
+		t.Fatalf("SaveOverride failed: %v", err)
+	}
+
+	expected, err := ComputeExpected("mayor")
+	if err != nil {
+		t.Fatalf("ComputeExpected failed: %v", err)
+	}
+
+	// Should have the built-in Task guard from DefaultOverrides
+	foundTaskGuard := false
+	for _, entry := range expected.PreToolUse {
+		if entry.Matcher == "Task" {
+			foundTaskGuard = true
+			break
+		}
+	}
+	if !foundTaskGuard {
+		t.Error("built-in Task guard should be present even with on-disk mayor override")
+	}
+
+	// Should also have the custom SessionStart from on-disk override
+	if len(expected.SessionStart) == 0 {
+		t.Error("on-disk SessionStart override should be present")
+	} else if expected.SessionStart[0].Hooks[0].Command != "custom-mayor-session" {
+		t.Errorf("expected custom-mayor-session, got %q", expected.SessionStart[0].Hooks[0].Command)
 	}
 }
 
