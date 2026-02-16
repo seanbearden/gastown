@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -43,13 +44,31 @@ func TestDoltBinaryCheck_DoltInstalled(t *testing.T) {
 	}
 }
 
+// writeFakeDolt creates a platform-appropriate fake "dolt" executable in dir.
+// On Unix, it writes a shell script. On Windows, it writes a .bat file.
+// Returns the filename written (e.g. "dolt" or "dolt.bat").
+func writeFakeDolt(t *testing.T, dir string, script string, batScript string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "dolt.bat")
+		if err := os.WriteFile(path, []byte(batScript), 0755); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		path := filepath.Join(dir, "dolt")
+		if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestDoltBinaryCheck_HermeticSuccess(t *testing.T) {
 	// Create a fake "dolt" binary that prints a version string
 	fakeDir := t.TempDir()
-	fakeDolt := filepath.Join(fakeDir, "dolt")
-	if err := os.WriteFile(fakeDolt, []byte("#!/bin/sh\necho 'dolt version 1.0.0'\n"), 0755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeDolt(t, fakeDir,
+		"#!/bin/sh\necho 'dolt version 1.0.0'\n",
+		"@echo off\r\necho dolt version 1.0.0\r\n",
+	)
 
 	t.Setenv("PATH", fakeDir)
 
@@ -95,10 +114,10 @@ func TestDoltBinaryCheck_DoltNotInPath(t *testing.T) {
 func TestDoltBinaryCheck_DoltVersionFails(t *testing.T) {
 	// Create a fake "dolt" binary that exits with an error
 	fakeDir := t.TempDir()
-	fakeDolt := filepath.Join(fakeDir, "dolt")
-	if err := os.WriteFile(fakeDolt, []byte("#!/bin/sh\nexit 1\n"), 0755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeDolt(t, fakeDir,
+		"#!/bin/sh\nexit 1\n",
+		"@echo off\r\nexit /b 1\r\n",
+	)
 
 	t.Setenv("PATH", fakeDir)
 
