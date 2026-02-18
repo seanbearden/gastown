@@ -2048,9 +2048,15 @@ func TestSlingPolecatEnvCheck(t *testing.T) {
 		wantBlock bool
 	}{
 		{
-			name:      "polecat role is blocked",
+			name:      "bare polecat role is blocked",
 			role:      "polecat",
 			polecat:   "alpha",
+			wantBlock: true,
+		},
+		{
+			name:      "compound polecat role is blocked",
+			role:      "gastown/polecats/Toast",
+			polecat:   "Toast",
 			wantBlock: true,
 		},
 		{
@@ -2060,14 +2066,20 @@ func TestSlingPolecatEnvCheck(t *testing.T) {
 			wantBlock: false,
 		},
 		{
-			name:      "witness with stale GT_POLECAT is NOT blocked",
-			role:      "witness",
+			name:      "compound witness with stale GT_POLECAT is NOT blocked",
+			role:      "gastown/witness",
 			polecat:   "alpha",
 			wantBlock: false,
 		},
 		{
 			name:      "crew with stale GT_POLECAT is NOT blocked",
 			role:      "crew",
+			polecat:   "alpha",
+			wantBlock: false,
+		},
+		{
+			name:      "compound crew with stale GT_POLECAT is NOT blocked",
+			role:      "gastown/crew/den",
 			polecat:   "alpha",
 			wantBlock: false,
 		},
