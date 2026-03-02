@@ -334,7 +334,3 @@ var DefaultNearLimitPatterns = []string{
 	`\d+\s*(messages?|requests?)\s*(left|remaining)`,               // "10 messages remaining"
 }
 
-// DefaultUsageThreshold is the utilization percentage above which an account
-// is considered near its limit. When the Claude usage API reports utilization
-// at or above this threshold, the scanner marks the session as near-limit.
-const DefaultUsageThreshold = 80.0

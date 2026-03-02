@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"os/signal"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -315,9 +317,7 @@ func printScanText(results []quota.ScanResult) error {
 				account = "(unknown)"
 			}
 			detail := ""
-			if r.Usage != nil {
-				detail = style.Dim.Render(fmt.Sprintf(" (%.0f%% utilization)", r.Usage.MaxUtilization()))
-			} else if r.MatchedLine != "" {
+			if r.MatchedLine != "" {
 				detail = style.Dim.Render(fmt.Sprintf(" (%s)", r.MatchedLine))
 			}
 			fmt.Printf(" %s %-25s %s %s%s\n",
@@ -797,9 +797,8 @@ func executeKeychainRotation(
 
 // Watch command flags
 var (
-	watchInterval  time.Duration
-	watchThreshold float64
-	watchDryRun    bool
+	watchInterval time.Duration
+	watchDryRun   bool
 )
 
 var quotaWatchCmd = &cobra.Command{
@@ -808,11 +807,7 @@ var quotaWatchCmd = &cobra.Command{
 	Long: `Continuously monitor sessions for approaching rate limits and rotate proactively.
 
 Polls all Gas Town sessions on the specified interval, checking for both
-hard rate limits and near-limit warning signals. Detection uses two methods:
-
-  1. Pane patterns: matches warning messages visible in tmux output
-  2. Usage API: queries Claude's usage endpoint for exact utilization %
-     (requires org_id in accounts.json or extractable from .claude.json)
+hard rate limits and near-limit warning signals via pane pattern matching.
 
 When a session is detected as approaching its limit, rotation is triggered
 before the hard 429 hits.
@@ -820,7 +815,6 @@ before the hard 429 hits.
 Examples:
   gt quota watch                      # Watch with default 5m interval
   gt quota watch --interval 2m        # Custom interval
-  gt quota watch --threshold 90       # Rotate at 90% utilization
   gt quota watch --dry-run            # Show detections without rotating`,
 	RunE: runQuotaWatch,
 }
@@ -840,12 +834,16 @@ func runQuotaWatch(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("need at least 2 accounts for rotation (have %d)", len(acctCfg.Accounts))
 	}
 
-	fmt.Printf(" %s Watching for near-limit signals (interval: %s, threshold: %.0f%%)\n",
-		style.Info.Render("Watch:"), watchInterval, watchThreshold)
+	fmt.Printf(" %s Watching for near-limit signals (interval: %s)\n",
+		style.Info.Render("Watch:"), watchInterval)
 	if watchDryRun {
 		fmt.Println(style.Dim.Render(" (dry run — detections only, no rotation)"))
 	}
 	fmt.Println()
+
+	// Handle graceful shutdown on SIGTERM/SIGINT
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	ticker := time.NewTicker(watchInterval)
 	defer ticker.Stop()
@@ -854,7 +852,12 @@ func runQuotaWatch(cmd *cobra.Command, args []string) error {
 	for {
 		runWatchCycle(townRoot, acctCfg)
 
-		<-ticker.C
+		select {
+		case <-sigCh:
+			fmt.Printf("\n %s Shutting down watch\n", style.Info.Render("Watch:"))
+			return nil
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -866,15 +869,11 @@ func runWatchCycle(townRoot string, acctCfg *config.AccountsConfig) {
 		return
 	}
 
-	// Enable near-limit detection
+	// Enable near-limit detection via pane patterns
 	if err := scanner.WithWarningPatterns(nil); err != nil {
 		style.PrintWarning("setting warning patterns: %v", err)
 		return
 	}
-
-	// Enable usage API if any accounts have credentials
-	usageClient := quota.NewHTTPUsageClient()
-	scanner.WithUsageChecker(usageClient, watchThreshold)
 
 	mgr := quota.NewManager(townRoot)
 	plan, err := quota.PlanRotation(scanner, mgr, acctCfg, quota.PlanOpts{IncludeNearLimit: true})
@@ -900,8 +899,8 @@ func runWatchCycle(townRoot string, acctCfg *config.AccountsConfig) {
 	}
 	for _, r := range plan.NearLimitSessions {
 		detail := ""
-		if r.Usage != nil {
-			detail = fmt.Sprintf(" (%.0f%%)", r.Usage.MaxUtilization())
+		if r.MatchedLine != "" {
+			detail = fmt.Sprintf(" (%s)", r.MatchedLine)
 		}
 		fmt.Printf(" [%s] %s %-25s %s%s\n",
 			style.Dim.Render(now),
@@ -948,7 +947,6 @@ func init() {
 	quotaRotateCmd.Flags().BoolVar(&rotateIdle, "idle", false, "Only rotate sessions at the idle prompt (skip busy agents)")
 
 	quotaWatchCmd.Flags().DurationVar(&watchInterval, "interval", 5*time.Minute, "Poll interval")
-	quotaWatchCmd.Flags().Float64Var(&watchThreshold, "threshold", constants.DefaultUsageThreshold, "Usage % threshold for near-limit detection")
 	quotaWatchCmd.Flags().BoolVar(&watchDryRun, "dry-run", false, "Show detections without executing rotation")
 
 	quotaCmd.AddCommand(quotaStatusCmd)

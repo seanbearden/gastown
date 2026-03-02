@@ -21,7 +21,6 @@ type ScanResult struct {
 	NearLimit     bool      `json:"near_limit"`               // whether approaching-limit signal was detected
 	MatchedLine   string    `json:"matched_line,omitempty"`   // the line that matched (hard or warning)
 	ResetsAt      string    `json:"resets_at,omitempty"`      // parsed reset time if available
-	Usage         *UsageInfo `json:"usage,omitempty"`          // usage API data if available
 }
 
 // TmuxClient is the interface for tmux operations needed by the scanner.
@@ -32,15 +31,12 @@ type TmuxClient interface {
 	GetEnvironment(session, key string) (string, error)
 }
 
-// Scanner detects rate-limited and near-limit sessions by examining tmux pane
-// content and optionally querying the Claude usage API.
+// Scanner detects rate-limited and near-limit sessions by examining tmux pane content.
 type Scanner struct {
 	tmux            TmuxClient
 	patterns        []*regexp.Regexp // hard rate-limit patterns
 	warningPatterns []*regexp.Regexp // near-limit warning patterns
 	accounts        *config.AccountsConfig
-	usageChecker    UsageChecker // nil = usage API disabled
-	usageThreshold  float64      // utilization % threshold for near-limit (default 80)
 }
 
 // NewScanner creates a scanner with the given tmux client and rate-limit patterns.
@@ -60,10 +56,9 @@ func NewScanner(tmux TmuxClient, patterns []string, accounts *config.AccountsCon
 	}
 
 	return &Scanner{
-		tmux:           tmux,
-		patterns:       compiled,
-		accounts:       accounts,
-		usageThreshold: constants.DefaultUsageThreshold,
+		tmux:     tmux,
+		patterns: compiled,
+		accounts: accounts,
 	}, nil
 }
 
@@ -86,16 +81,6 @@ func (s *Scanner) WithWarningPatterns(patterns []string) error {
 	return nil
 }
 
-// WithUsageChecker enables usage API-based near-limit detection.
-// The threshold is the utilization percentage (0-100) above which a session
-// is considered near its limit. Pass 0 to use the default (80%).
-func (s *Scanner) WithUsageChecker(checker UsageChecker, threshold float64) {
-	s.usageChecker = checker
-	if threshold > 0 {
-		s.usageThreshold = threshold
-	}
-}
-
 // scanLines is the number of pane lines to capture for rate-limit detection.
 // We capture a generous window but only check the bottom checkLines for
 // rate-limit patterns — if the limit was resolved, subsequent output pushes
@@ -111,8 +96,7 @@ const scanLines = 30
 const checkLines = 20
 
 // ScanAll scans all Gas Town tmux sessions for rate-limit and near-limit indicators.
-// Returns results for all Gas Town sessions. After pane scanning, optionally
-// enriches results with usage API data.
+// Returns results for all Gas Town sessions.
 func (s *Scanner) ScanAll() ([]ScanResult, error) {
 	sessions, err := s.tmux.ListSessions()
 	if err != nil {
@@ -127,11 +111,6 @@ func (s *Scanner) ScanAll() ([]ScanResult, error) {
 
 		result := s.scanSession(sess)
 		results = append(results, result)
-	}
-
-	// Enrich with usage API data (best-effort, errors logged not fatal)
-	if s.usageChecker != nil && s.accounts != nil {
-		s.enrichWithUsage(results)
 	}
 
 	return results, nil
@@ -207,86 +186,6 @@ func (s *Scanner) scanSession(session string) ScanResult {
 	}
 
 	return result
-}
-
-// enrichWithUsage queries the Claude usage API for each unique account in the
-// results and marks sessions as near-limit if utilization exceeds the threshold.
-// Errors are silently ignored — usage API is best-effort enrichment.
-func (s *Scanner) enrichWithUsage(results []ScanResult) {
-	// Collect unique accounts and their credentials
-	type creds struct {
-		orgID, cookie string
-	}
-	accountCreds := make(map[string]*creds)
-
-	for i := range results {
-		handle := results[i].AccountHandle
-		if handle == "" {
-			continue
-		}
-		if _, seen := accountCreds[handle]; seen {
-			continue
-		}
-
-		acct, ok := s.accounts.Accounts[handle]
-		if !ok {
-			continue
-		}
-
-		configDir := util.ExpandHome(acct.ConfigDir)
-
-		// OrgID: explicit config > extracted from .claude.json
-		orgID := acct.OrgID
-		if orgID == "" {
-			orgID = ReadOrgID(configDir)
-		}
-		if orgID == "" {
-			continue // can't query usage API without org ID
-		}
-
-		// SessionCookie: explicit config > keychain token
-		cookie := acct.SessionCookie
-		if cookie == "" {
-			serviceName := KeychainServiceName(configDir)
-			token, err := ReadKeychainToken(serviceName)
-			if err == nil && token != "" {
-				cookie = token
-			}
-		}
-		if cookie == "" {
-			continue // can't query usage API without auth
-		}
-
-		accountCreds[handle] = &creds{orgID: orgID, cookie: cookie}
-	}
-
-	// Fetch usage for each account (one API call per account, not per session)
-	accountUsage := make(map[string]*UsageInfo)
-	for handle, c := range accountCreds {
-		usage, err := s.usageChecker.FetchUsage(c.orgID, c.cookie)
-		if err != nil {
-			continue // silently skip — usage API is best-effort
-		}
-		accountUsage[handle] = usage
-	}
-
-	// Enrich results
-	for i := range results {
-		handle := results[i].AccountHandle
-		usage, ok := accountUsage[handle]
-		if !ok {
-			continue
-		}
-
-		results[i].Usage = usage
-
-		// Mark as near-limit if utilization exceeds threshold and not already hard-limited
-		if !results[i].RateLimited && !results[i].NearLimit {
-			if usage.MaxUtilization() >= s.usageThreshold {
-				results[i].NearLimit = true
-			}
-		}
-	}
 }
 
 // resolveAccountHandle maps a session's active account back to a handle.
