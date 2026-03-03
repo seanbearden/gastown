@@ -753,7 +753,8 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 	worktreeCreated = true
 
 	if err := m.setupSharedBeads(clonePath); err != nil {
-		style.PrintWarning("could not set up shared beads: %v", err)
+		cleanupOnError()
+		return nil, fmt.Errorf("setting up shared beads: %w (polecat cannot submit MRs without shared beads)", err)
 	}
 
 	if err := beads.ProvisionPrimeMDForWorktree(clonePath); err != nil {
@@ -922,10 +923,11 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 
 	// Set up shared beads: polecat uses rig's .beads via redirect file.
 	// This eliminates git sync overhead - all polecats share one database.
+	// Fatal: without shared beads, gt done writes MR beads to a local .beads/
+	// that the Refinery never reads, causing the merge queue to stay empty.
 	if err := m.setupSharedBeads(clonePath); err != nil {
-		// Non-fatal - polecat can still work with local beads
-		// Log warning but don't fail the spawn
-		style.PrintWarning("could not set up shared beads: %v", err)
+		cleanupOnError()
+		return nil, fmt.Errorf("setting up shared beads: %w (polecat cannot submit MRs without shared beads)", err)
 	}
 
 	// Provision PRIME.md with Gas Town context for this worker.
@@ -1418,8 +1420,13 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	// Prune stale worktree entries (non-fatal: cleanup only)
 	_ = repoGit.WorktreePrune()
 
-	// Move temp worktree to final location
-	if err := os.Rename(tmpClonePath, newClonePath); err != nil {
+	// Move temp worktree to final location using git worktree move.
+	// os.Rename breaks worktrees: the .git file and registry gitdir still
+	// reference the old temp path, leaving a broken worktree. (GH#2056)
+	if err := repoGit.WorktreeMove(tmpClonePath, newClonePath); err != nil {
+		// Clean up temp worktree if move fails
+		_ = repoGit.WorktreeRemove(tmpClonePath, true)
+		_ = os.RemoveAll(tmpClonePath)
 		return nil, fmt.Errorf("moving repaired worktree to final path: %w", err)
 	}
 
@@ -1427,9 +1434,11 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	// Only ~/gt/CLAUDE.md (town-root identity anchor) exists on disk.
 	// Full context is injected ephemerally via SessionStart hook (gt prime).
 
-	// Set up shared beads
+	// Set up shared beads — fatal during repair too, same reason as spawn.
 	if err := m.setupSharedBeads(newClonePath); err != nil {
-		style.PrintWarning("could not set up shared beads: %v", err)
+		_ = repoGit.WorktreeRemove(newClonePath, true)
+		_ = os.RemoveAll(newClonePath)
+		return nil, fmt.Errorf("setting up shared beads after repair: %w (polecat cannot submit MRs without shared beads)", err)
 	}
 
 	// Copy overlay files from .runtime/overlay/ to polecat root.

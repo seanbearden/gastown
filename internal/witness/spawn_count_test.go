@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/config"
 )
 
 func TestRecordBeadRespawn_Increments(t *testing.T) {
@@ -32,7 +34,7 @@ func TestShouldBlockRespawn_Threshold(t *testing.T) {
 	}
 
 	// Below threshold.
-	for i := 0; i < DefaultMaxBeadRespawns-1; i++ {
+	for i := 0; i < config.DefaultWitnessMaxBeadRespawns-1; i++ {
 		RecordBeadRespawn(tmpDir, "bead-2")
 	}
 	if ShouldBlockRespawn(tmpDir, "bead-2") {

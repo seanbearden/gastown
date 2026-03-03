@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -581,7 +583,7 @@ func TestDetectZombie_DoneIntentDeadSession(t *testing.T) {
 	age := time.Since(doneIntent.Timestamp)
 
 	// Dead session + old intent → restart path (gt-dsgp: was auto-nuke)
-	shouldRestart := !sessionAlive && doneIntent != nil && age >= DoneIntentGracePeriod
+	shouldRestart := !sessionAlive && doneIntent != nil && age >= config.DefaultWitnessDoneIntentStuckTimeout
 	if !shouldRestart {
 		t.Errorf("expected restart for dead session + old done-intent (age=%v)", age)
 	}
@@ -599,7 +601,7 @@ func TestDetectZombie_DoneIntentLiveStuck(t *testing.T) {
 	age := time.Since(doneIntent.Timestamp)
 
 	// Live session + old intent → restart stuck session (gt-dsgp: was kill)
-	shouldRestart := sessionAlive && doneIntent != nil && age > DoneIntentGracePeriod
+	shouldRestart := sessionAlive && doneIntent != nil && age > config.DefaultWitnessDoneIntentStuckTimeout
 	if !shouldRestart {
 		t.Errorf("expected restart for live session + old done-intent (age=%v)", age)
 	}
@@ -607,7 +609,7 @@ func TestDetectZombie_DoneIntentLiveStuck(t *testing.T) {
 
 func TestDetectZombie_DoneIntentRecent(t *testing.T) {
 	t.Parallel()
-	// Verify the logic: done-intent younger than DoneIntentGracePeriod → skip (polecat still working)
+	// Verify the logic: done-intent younger than config.DefaultWitnessDoneIntentStuckTimeout → skip (polecat still working)
 	doneIntent := &DoneIntent{
 		ExitType:  "COMPLETED",
 		Timestamp: time.Now().Add(-10 * time.Second), // 10s old
@@ -616,14 +618,14 @@ func TestDetectZombie_DoneIntentRecent(t *testing.T) {
 	age := time.Since(doneIntent.Timestamp)
 
 	// Recent intent → should skip
-	shouldSkip := !sessionAlive && doneIntent != nil && age < DoneIntentGracePeriod
+	shouldSkip := !sessionAlive && doneIntent != nil && age < config.DefaultWitnessDoneIntentStuckTimeout
 	if !shouldSkip {
 		t.Errorf("expected skip for recent done-intent (age=%v)", age)
 	}
 
 	// Live session + recent intent → also skip
 	sessionAlive = true
-	shouldSkipLive := sessionAlive && doneIntent != nil && age <= DoneIntentGracePeriod
+	shouldSkipLive := sessionAlive && doneIntent != nil && age <= config.DefaultWitnessDoneIntentStuckTimeout
 	if !shouldSkipLive {
 		t.Errorf("expected skip for live session + recent done-intent (age=%v)", age)
 	}
@@ -767,7 +769,7 @@ func TestDetectZombie_BeadClosedVsDoneIntent(t *testing.T) {
 
 	// Done-intent exists + bead closed → done-intent check runs first,
 	// closed-bead check should NOT run (it's in the else branch)
-	doneIntentHandled := sessionAlive && doneIntent != nil && time.Since(doneIntent.Timestamp) > DoneIntentGracePeriod
+	doneIntentHandled := sessionAlive && doneIntent != nil && time.Since(doneIntent.Timestamp) > config.DefaultWitnessDoneIntentStuckTimeout
 	closedBeadCheck := sessionAlive && agentAlive && doneIntent == nil &&
 		hookBead != "" && beadStatus == "closed"
 
@@ -797,6 +799,94 @@ func TestResetAbandonedBead_NoRouter(t *testing.T) {
 	result := resetAbandonedBead(DefaultBdCli(), "/tmp/nonexistent", "testrig", "gt-fake123", "nux", nil)
 	if result {
 		t.Error("resetAbandonedBead should return false when bd commands fail")
+	}
+}
+
+func TestResetAbandonedBead_ClosesWhenWorkOnMain(t *testing.T) {
+	// Not parallel: overrides package-level verifyCommitOnMain.
+	// When verifyCommitOnMain returns true, resetAbandonedBead should close the
+	// bead instead of resetting it for re-dispatch. This is the fix for #2036.
+
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return true, nil // work is on main
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
+	if result {
+		t.Error("resetAbandonedBead should return false when work is on main (bead closed, not re-dispatched)")
+	}
+
+	// Verify "close" was called, NOT "update ... --status=open"
+	var foundClose, foundUpdate bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "close gt-work123") {
+			foundClose = true
+		}
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			foundUpdate = true
+		}
+	}
+	if !foundClose {
+		t.Errorf("expected bd close to be called, got calls: %v", mock.calls)
+	}
+	if foundUpdate {
+		t.Error("bd update --status=open should NOT be called when work is on main")
+	}
+}
+
+func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
+	// Not parallel: overrides package-level verifyCommitOnMain.
+	// When verifyCommitOnMain returns false, resetAbandonedBead should reset
+	// the bead for re-dispatch (existing behavior).
+
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return false, nil // work NOT on main
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
+	if !result {
+		t.Error("resetAbandonedBead should return true when work is NOT on main (bead reset for re-dispatch)")
+	}
+
+	// Verify "update --status=open" was called (normal reset path)
+	var foundUpdate bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			foundUpdate = true
+		}
+	}
+	if !foundUpdate {
+		t.Errorf("expected bd update --status=open to be called, got calls: %v", mock.calls)
 	}
 }
 
@@ -938,18 +1028,21 @@ func TestDetectStalledPolecats_NoSession(t *testing.T) {
 
 func TestStartupStallThresholds(t *testing.T) {
 	t.Parallel()
-	// Verify thresholds are reasonable
-	if StartupStallThreshold < 30*time.Second {
-		t.Errorf("StartupStallThreshold = %v, too short (< 30s)", StartupStallThreshold)
+	// Verify config defaults are reasonable (tests the operational config defaults,
+	// not removed handler constants).
+	stallThreshold := config.DefaultWitnessStartupStallThreshold
+	activityGrace := config.DefaultWitnessStartupActivityGrace
+	if stallThreshold < 30*time.Second {
+		t.Errorf("DefaultWitnessStartupStallThreshold = %v, too short (< 30s)", stallThreshold)
 	}
-	if StartupStallThreshold > 5*time.Minute {
-		t.Errorf("StartupStallThreshold = %v, too long (> 5min)", StartupStallThreshold)
+	if stallThreshold > 5*time.Minute {
+		t.Errorf("DefaultWitnessStartupStallThreshold = %v, too long (> 5min)", stallThreshold)
 	}
-	if StartupActivityGrace < 15*time.Second {
-		t.Errorf("StartupActivityGrace = %v, too short (< 15s)", StartupActivityGrace)
+	if activityGrace < 15*time.Second {
+		t.Errorf("DefaultWitnessStartupActivityGrace = %v, too short (< 15s)", activityGrace)
 	}
-	if StartupActivityGrace > 5*time.Minute {
-		t.Errorf("StartupActivityGrace = %v, too long (> 5min)", StartupActivityGrace)
+	if activityGrace > 5*time.Minute {
+		t.Errorf("DefaultWitnessStartupActivityGrace = %v, too long (> 5min)", activityGrace)
 	}
 }
 
@@ -1562,257 +1655,147 @@ func TestClearCompletionMetadata_NoBd(t *testing.T) {
 	}
 }
 
-// installMockBd replaces the defaultBdProvider package variable with a mock BdCli.
-// This allows IsBeadActivelyWorked and other standalone functions to use a test double.
-func installMockBd(t *testing.T, execFn func(args []string) (string, error), runFn func(args []string) error) {
-	t.Helper()
-	old := defaultBdProvider
-	bd, _ := mockBd(execFn, runFn)
-	defaultBdProvider = func() *BdCli { return bd }
-	t.Cleanup(func() { defaultBdProvider = old })
-}
 
-// installMockHasSession replaces the hasSession package variable with a mock.
-// The mockFn receives a session name and returns (alive, error).
-func installMockHasSession(t *testing.T, mockFn func(sessionName string) (bool, error)) {
-	t.Helper()
-	old := hasSession
-	hasSession = mockFn
-	t.Cleanup(func() { hasSession = old })
-}
+// --- Heartbeat v2 tests (gt-3vr5) ---
 
-func TestIsBeadActivelyWorked_EmptyBeadID(t *testing.T) {
+func TestHeartbeatV2_ExitingStateSkipsZombieDetection(t *testing.T) {
 	t.Parallel()
-	if IsBeadActivelyWorked("/tmp", "testrig", "", "") {
-		t.Error("IsBeadActivelyWorked should return false for empty beadID")
+	// Agent reports "exiting" state via heartbeat v2.
+	// The witness should trust the agent and NOT flag as zombie,
+	// even if done-intent is older than config.DefaultWitnessDoneIntentStuckTimeout.
+	// This replaces timer-based inference for v2 agents.
+
+	// Fresh heartbeat with state="exiting" → not a zombie
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatExiting,
+	}
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	if stale {
+		t.Error("fresh heartbeat should not be stale")
+	}
+	if hb.EffectiveState() != polecat.HeartbeatExiting {
+		t.Errorf("EffectiveState() = %q, want %q", hb.EffectiveState(), polecat.HeartbeatExiting)
+	}
+
+	// With a v2 exiting heartbeat, the witness should NOT check done-intent timers
+	shouldSkip := hb.IsV2() && !stale && hb.EffectiveState() == polecat.HeartbeatExiting
+	if !shouldSkip {
+		t.Error("expected v2 exiting heartbeat to skip zombie detection")
 	}
 }
 
-func TestIsBeadActivelyWorked_NoPolecatsDir(t *testing.T) {
+func TestHeartbeatV2_StuckStateEscalates(t *testing.T) {
 	t.Parallel()
-	if IsBeadActivelyWorked("/tmp/nonexistent", "testrig", "gt-123", "") {
-		t.Error("IsBeadActivelyWorked should return false when polecats dir doesn't exist")
+	// Agent self-reports "stuck" via heartbeat v2.
+	// The witness should escalate (not restart — agent is alive).
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatStuck,
+		Context:   "blocked on auth issue",
+	}
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	if stale {
+		t.Error("fresh heartbeat should not be stale")
+	}
+
+	shouldEscalate := hb.IsV2() && !stale && hb.EffectiveState() == polecat.HeartbeatStuck
+	if !shouldEscalate {
+		t.Error("expected v2 stuck heartbeat to trigger escalation")
 	}
 }
 
-func TestIsBeadActivelyWorked_NoMatchingBead(t *testing.T) {
-	// Set up town directory with polecats
-	townRoot := t.TempDir()
-	rigName := "testrig"
-	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
-	if err := os.MkdirAll(filepath.Join(polecatsDir, "alpha"), 0o755); err != nil {
-		t.Fatal(err)
+func TestHeartbeatV2_WorkingStateHealthy(t *testing.T) {
+	t.Parallel()
+	// Agent heartbeats "working" — healthy, not a zombie.
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatWorking,
 	}
-
-	// Mock bd: alpha has a different bead hooked
-	installMockBd(t,
-		func(args []string) (string, error) {
-			if len(args) > 0 && args[0] == "show" {
-				return `[{"agent_state":"working","hook_bead":"gt-OTHER"}]`, nil
-			}
-			return "{}", nil
-		},
-		func(args []string) error { return nil },
-	)
-	installMockHasSession(t, func(name string) (bool, error) {
-		return true, nil // Session is alive
-	})
-
-	if IsBeadActivelyWorked(townRoot, rigName, "gt-TARGET", "") {
-		t.Error("should return false when no polecat has the target bead")
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	shouldSkip := hb.IsV2() && !stale && (hb.EffectiveState() == polecat.HeartbeatWorking || hb.EffectiveState() == polecat.HeartbeatIdle)
+	if !shouldSkip {
+		t.Error("expected v2 working heartbeat to skip zombie detection")
 	}
 }
 
-func TestIsBeadActivelyWorked_MatchingBeadLiveSession(t *testing.T) {
-	// Set up town directory with polecats
-	townRoot := t.TempDir()
-	rigName := "testrig"
-	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
-	if err := os.MkdirAll(filepath.Join(polecatsDir, "alpha"), 0o755); err != nil {
-		t.Fatal(err)
+func TestHeartbeatV2_IdleStateHealthy(t *testing.T) {
+	t.Parallel()
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatIdle,
 	}
-
-	// Mock bd: alpha has the target bead hooked
-	installMockBd(t,
-		func(args []string) (string, error) {
-			if len(args) > 0 && args[0] == "show" {
-				return `[{"agent_state":"working","hook_bead":"gt-TARGET"}]`, nil
-			}
-			return "{}", nil
-		},
-		func(args []string) error { return nil },
-	)
-	installMockHasSession(t, func(name string) (bool, error) {
-		return true, nil // Session is alive
-	})
-
-	if !IsBeadActivelyWorked(townRoot, rigName, "gt-TARGET", "") {
-		t.Error("should return true when a live polecat has the target bead")
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	shouldSkip := hb.IsV2() && !stale && (hb.EffectiveState() == polecat.HeartbeatWorking || hb.EffectiveState() == polecat.HeartbeatIdle)
+	if !shouldSkip {
+		t.Error("expected v2 idle heartbeat to skip zombie detection")
 	}
 }
 
-func TestIsBeadActivelyWorked_MatchingBeadDeadSession(t *testing.T) {
-	// Set up town directory with polecats
-	townRoot := t.TempDir()
-	rigName := "testrig"
-	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
-	if err := os.MkdirAll(filepath.Join(polecatsDir, "alpha"), 0o755); err != nil {
-		t.Fatal(err)
+func TestHeartbeatV2_StaleHeartbeatFallsThrough(t *testing.T) {
+	t.Parallel()
+	// Stale v2 heartbeat (agent died) → fall through to legacy detection.
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now().Add(-10 * time.Minute), // 10min old → stale
+		State:     polecat.HeartbeatWorking,
+	}
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	if !stale {
+		t.Error("10-minute-old heartbeat should be stale")
 	}
 
-	// Mock bd: alpha has the target bead hooked
-	installMockBd(t,
-		func(args []string) (string, error) {
-			if len(args) > 0 && args[0] == "show" {
-				return `[{"agent_state":"working","hook_bead":"gt-TARGET"}]`, nil
-			}
-			return "{}", nil
-		},
-		func(args []string) error { return nil },
-	)
-	installMockHasSession(t, func(name string) (bool, error) {
-		return false, nil // Session is dead
-	})
-
-	if IsBeadActivelyWorked(townRoot, rigName, "gt-TARGET", "") {
-		t.Error("should return false when polecat has the bead but session is dead")
+	// Stale heartbeat should NOT skip zombie detection — falls through to legacy
+	shouldSkip := hb.IsV2() && !stale
+	if shouldSkip {
+		t.Error("stale v2 heartbeat should fall through to legacy detection")
 	}
 }
 
-func TestIsBeadActivelyWorked_ExcludesPolecat(t *testing.T) {
-	// Set up town directory with one polecat
-	townRoot := t.TempDir()
-	rigName := "testrig"
-	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
-	if err := os.MkdirAll(filepath.Join(polecatsDir, "alpha"), 0o755); err != nil {
-		t.Fatal(err)
+func TestHeartbeatV2_V1FallsThrough(t *testing.T) {
+	t.Parallel()
+	// v1 heartbeat (no state field) → fall through to legacy detection.
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		// No State field → v1
+	}
+	if hb.IsV2() {
+		t.Error("expected IsV2()=false for v1 heartbeat")
 	}
 
-	// Mock bd: alpha has the target bead hooked and session is alive
-	installMockBd(t,
-		func(args []string) (string, error) {
-			if len(args) > 0 && args[0] == "show" {
-				return `[{"agent_state":"working","hook_bead":"gt-TARGET"}]`, nil
-			}
-			return "{}", nil
-		},
-		func(args []string) error { return nil },
-	)
-	installMockHasSession(t, func(name string) (bool, error) {
-		return true, nil
-	})
-
-	// Exclude "alpha" — should return false since it's the only polecat
-	if IsBeadActivelyWorked(townRoot, rigName, "gt-TARGET", "alpha") {
-		t.Error("should return false when the matching polecat is excluded")
+	// v1 heartbeat should NOT trigger v2 logic
+	shouldUseV2 := hb.IsV2()
+	if shouldUseV2 {
+		t.Error("v1 heartbeat should fall through to legacy detection")
 	}
 }
 
-func TestIsBeadActivelyWorked_MultiplePolecats(t *testing.T) {
-	// Set up town directory with multiple polecats
-	townRoot := t.TempDir()
-	rigName := "testrig"
-	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
-	for _, name := range []string{"alpha", "bravo", "charlie"} {
-		if err := os.MkdirAll(filepath.Join(polecatsDir, name), 0o755); err != nil {
-			t.Fatal(err)
-		}
+func TestHeartbeatV2_DeadSessionFreshHeartbeatRace(t *testing.T) {
+	t.Parallel()
+	// Dead session but fresh heartbeat → possible race (session just restarted).
+	// Should skip zombie detection to avoid killing a newly-started session.
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatWorking,
 	}
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	sessionDead := true
 
-	// Mock bd: alpha dead (excluded), bravo has different bead, charlie has target
-	installMockBd(t,
-		func(args []string) (string, error) {
-			if len(args) > 0 && args[0] == "show" {
-				beadID := args[1]
-				if strings.Contains(beadID, "bravo") {
-					return `[{"agent_state":"working","hook_bead":"gt-OTHER"}]`, nil
-				}
-				if strings.Contains(beadID, "charlie") {
-					return `[{"agent_state":"working","hook_bead":"gt-TARGET"}]`, nil
-				}
-				return `[{"agent_state":"working","hook_bead":"gt-TARGET"}]`, nil
-			}
-			return "{}", nil
-		},
-		func(args []string) error { return nil },
-	)
-	installMockHasSession(t, func(name string) (bool, error) {
-		return true, nil // All sessions alive
-	})
-
-	// alpha excluded, bravo has different bead, charlie has target and is alive
-	if !IsBeadActivelyWorked(townRoot, rigName, "gt-TARGET", "alpha") {
-		t.Error("should return true: charlie has the target bead and is alive")
+	// Fresh heartbeat + dead session → skip (race condition)
+	shouldSkip := sessionDead && hb.IsV2() && !stale
+	if !shouldSkip {
+		t.Error("expected fresh v2 heartbeat + dead session to skip zombie detection (race)")
 	}
 }
 
-func TestIsBeadActivelyWorked_SkipsHiddenDirs(t *testing.T) {
-	townRoot := t.TempDir()
-	rigName := "testrig"
-	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
-	// Create a hidden directory that should be skipped
-	if err := os.MkdirAll(filepath.Join(polecatsDir, ".hidden"), 0o755); err != nil {
-		t.Fatal(err)
+func TestZombieAgentSelfReportedStuck_Classification(t *testing.T) {
+	t.Parallel()
+	// Verify the new classification type
+	if ZombieAgentSelfReportedStuck != "agent-self-reported-stuck" {
+		t.Errorf("ZombieAgentSelfReportedStuck = %q, want %q", ZombieAgentSelfReportedStuck, "agent-self-reported-stuck")
 	}
-
-	installMockBd(t,
-		func(args []string) (string, error) {
-			return `[{"agent_state":"working","hook_bead":"gt-TARGET"}]`, nil
-		},
-		func(args []string) error { return nil },
-	)
-	installMockHasSession(t, func(name string) (bool, error) {
-		return true, nil
-	})
-
-	if IsBeadActivelyWorked(townRoot, rigName, "gt-TARGET", "") {
-		t.Error("should return false: hidden dirs should be skipped")
-	}
-}
-
-func TestResetAbandonedBead_SkipsWhenBeadActivelyWorked(t *testing.T) {
-	// Set up town directory with two polecats: alpha (dead) and bravo (alive with same bead)
-	townRoot := t.TempDir()
-	rigName := "testrig"
-	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
-	for _, name := range []string{"alpha", "bravo"} {
-		if err := os.MkdirAll(filepath.Join(polecatsDir, name), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	resetCalled := false
-	installMockBd(t,
-		func(args []string) (string, error) {
-			if len(args) > 0 && args[0] == "show" {
-				beadID := args[1]
-				// Agent bead queries return hook_bead
-				if strings.Contains(beadID, "bravo") {
-					return `[{"agent_state":"working","hook_bead":"gt-TARGET"}]`, nil
-				}
-				// Work bead status query
-				return `[{"status":"hooked"}]`, nil
-			}
-			return "{}", nil
-		},
-		func(args []string) error {
-			if len(args) > 0 && args[0] == "update" {
-				resetCalled = true
-			}
-			return nil
-		},
-	)
-	installMockHasSession(t, func(name string) (bool, error) {
-		return true, nil // bravo's session is alive
-	})
-
-	// alpha is dead, bravo is alive with same bead — should NOT reset
-	result := resetAbandonedBead(defaultBdProvider(), townRoot, rigName, "gt-TARGET", "alpha", nil)
-	if result {
-		t.Error("resetAbandonedBead should return false when another live polecat has the bead")
-	}
-	if resetCalled {
-		t.Error("bd update should not have been called — bead is actively worked")
+	// Should imply active work (agent is alive and asking for help)
+	if !ZombieAgentSelfReportedStuck.ImpliesActiveWork() {
+		t.Error("ZombieAgentSelfReportedStuck should imply active work")
 	}
 }
 

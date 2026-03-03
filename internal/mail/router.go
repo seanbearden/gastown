@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -1113,12 +1115,10 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// Add actor for attribution (sender identity)
 	args = append(args, "--actor", msg.From)
 
-	// Pass the pre-generated message ID so bd uses it instead of generating its own.
-	// Without this, the ephemeral (SQLite) insert path produces empty IDs,
-	// causing UNIQUE constraint failures on subsequent sends (#2095).
-	if msg.ID != "" {
-		args = append(args, "--id", msg.ID)
-	}
+	// Do NOT pass --id to bd create. The msg.ID (msg-xxx prefix) is for
+	// in-memory tracking only. bd auto-generates IDs with the correct
+	// database prefix (e.g., hq-wisp-xxx). Passing --id causes prefix
+	// mismatch errors when the msg- prefix does not match the database.
 
 	// Add --ephemeral flag for ephemeral messages (wisps, not synced to git)
 	if r.shouldBeWisp(msg) {
@@ -1136,6 +1136,16 @@ func (r *Router) sendToSingle(msg *Message) error {
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
 	_, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	telemetry.RecordMailMessage(context.Background(), "send", telemetry.MailMessageInfo{
+		ID:       msg.ID,
+		From:     msg.From,
+		To:       msg.To,
+		Subject:  msg.Subject,
+		Body:     msg.Body,
+		ThreadID: msg.ThreadID,
+		Priority: string(msg.Priority),
+		MsgType:  string(msg.Type),
+	}, err)
 	if err != nil {
 		return fmt.Errorf("sending message: %w", err)
 	}

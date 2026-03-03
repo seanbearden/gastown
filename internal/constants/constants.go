@@ -15,8 +15,11 @@ const (
 	ShutdownNotifyDelay = 500 * time.Millisecond
 
 	// ClaudeStartTimeout is how long to wait for Claude to start in a session.
+	// 180s because the first turn must complete before ❯ appears: hooks fire
+	// (gt prime injects patrol context), then the full API round-trip runs.
+	// With large patrol formulas this regularly exceeds 60s, especially on Opus.
 	// Configurable via operational.session.claude_start_timeout.
-	ClaudeStartTimeout = 60 * time.Second
+	ClaudeStartTimeout = 180 * time.Second
 
 	// ShellReadyTimeout is how long to wait for shell prompt after command.
 	// Configurable via operational.session.shell_ready_timeout.
@@ -75,6 +78,13 @@ const (
 	// StartupNudgeMaxRetries is the maximum number of times to retry a startup nudge.
 	// Configurable via operational.session.startup_nudge_max_retries.
 	StartupNudgeMaxRetries = 3
+
+	// MinHandoffCooldown is the minimum time between handoffs for the same
+	// component. Prevents tight restart loops when a patrol agent (e.g.,
+	// witness) completes quickly on idle rigs and immediately hands off.
+	// (gt-058d)
+	// Configurable via operational.session.min_handoff_cooldown.
+	MinHandoffCooldown = 2 * time.Minute
 
 	// GUPPViolationTimeout is how long an agent can have work on hook without
 	// progressing before it's considered a GUPP violation.
@@ -136,6 +146,11 @@ const (
 	// This prevents the handoff loop bug where agents re-run /handoff from context.
 	FileHandoffMarker = "handoff_to_successor"
 
+	// FileLastHandoffTS records the timestamp of the last handoff.
+	// Used to enforce MinHandoffCooldown and prevent tight restart loops.
+	// (gt-058d)
+	FileLastHandoffTS = "last_handoff_ts"
+
 	// FileQuotaJSON is the quota state file in mayor/.
 	FileQuotaJSON = "quota.json"
 )
@@ -164,6 +179,23 @@ const (
 // BeadsCustomTypesList returns the custom types as a slice.
 func BeadsCustomTypesList() []string {
 	return []string{"agent", "role", "rig", "convoy", "slot", "queue", "event", "message", "molecule", "gate", "merge-request"}
+}
+
+// Beads custom status configuration constants.
+const (
+	// BeadsCustomStatuses is the comma-separated list of custom issue statuses
+	// that Gas Town registers with beads. Convoy staging uses staged_ready and
+	// staged_warnings to track convoy readiness before launch.
+	//
+	// Status origins:
+	//   staged_ready    - Convoy staged with no warnings (ready to launch)
+	//   staged_warnings - Convoy staged with warnings (requires --force to launch)
+	BeadsCustomStatuses = "staged_ready,staged_warnings"
+)
+
+// BeadsCustomStatusesList returns the custom statuses as a slice.
+func BeadsCustomStatusesList() []string {
+	return []string{"staged_ready", "staged_warnings"}
 }
 
 // Git branch names.

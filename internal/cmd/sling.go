@@ -21,9 +21,10 @@ import (
 )
 
 var slingCmd = &cobra.Command{
-	Use:     "sling <bead-or-formula> [target]",
-	GroupID: GroupWork,
-	Short:   "Assign work to an agent (THE unified work dispatch command)",
+	Use:         "sling <bead-or-formula> [target]",
+	GroupID:     GroupWork,
+	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
+	Short:       "Assign work to an agent (THE unified work dispatch command)",
 	Long: `Sling work onto an agent's hook and start working immediately.
 
 This is THE command for assigning work in Gas Town. It handles:
@@ -186,6 +187,10 @@ func runSlingRespawnReset(_ *cobra.Command, args []string) error {
 }
 
 func runSling(cmd *cobra.Command, args []string) (retErr error) {
+	ctx := context.Background()
+	if cmd != nil {
+		ctx = cmd.Context()
+	}
 	defer func() {
 		bead, target := "", ""
 		if len(args) > 0 {
@@ -194,7 +199,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		if len(args) > 1 {
 			target = args[1]
 		}
-		telemetry.RecordSling(context.Background(), bead, target, retErr)
+		telemetry.RecordSling(ctx, bead, target, retErr)
 	}()
 	// Polecats cannot sling - check early before writing anything.
 	// Check GT_ROLE first: coordinators (mayor, witness, etc.) may have a stale
@@ -518,7 +523,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 				// Standalone formula mode: gt sling <formula> [target]
 				// Standalone formula: deferred dispatch is handled above (formula-on-bead),
 				// so no scheduler check needed here.
-				return runSlingFormula(args)
+				return runSlingFormula(ctx, args)
 			}
 			// Not a formula either - check if it looks like a bead ID (routing issue workaround).
 			// Accept it and let the actual bd update fail later if the bead doesn't exist.
@@ -836,7 +841,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			slingVars = append(rigCmdVars, slingVars...)
 		}
 
-		result, err := InstantiateFormulaOnBead(formulaName, beadID, info.Title, hookWorkDir, townRoot, false, slingVars)
+		result, err := InstantiateFormulaOnBead(ctx, formulaName, beadID, info.Title, hookWorkDir, townRoot, false, slingVars)
 		if err != nil {
 			// If we spawned a fresh polecat (rig target), rollback the partial artifacts.
 			// Otherwise, a wisp creation failure (e.g., missing required vars) leaves an orphaned polecat.

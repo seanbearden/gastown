@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -69,17 +71,6 @@ func DefaultBdCli() *BdCli {
 			return util.ExecRun(workDir, "bd", args...)
 		},
 	}
-}
-
-// defaultBdProvider returns the BdCli used by standalone functions like
-// IsBeadActivelyWorked. Tests override this to avoid shelling out to bd.
-var defaultBdProvider = func() *BdCli { return DefaultBdCli() }
-
-// hasSession checks if a tmux session exists. Tests override this to avoid
-// requiring a live tmux server.
-var hasSession = func(sessionName string) (bool, error) {
-	t := tmux.NewTmux()
-	return t.HasSession(sessionName)
 }
 
 // initRegistryFromTownRoot initializes registries from a known town root,
@@ -811,7 +802,11 @@ func AutoNukeIfClean(workDir, rigName, polecatName string) *NukePolecatResult {
 //   - true, nil: commit is verified on default branch
 //   - false, nil: commit is NOT on default branch (don't nuke!)
 //   - false, error: couldn't verify (treat as unsafe)
-func verifyCommitOnMain(workDir, rigName, polecatName string) (bool, error) {
+//
+// This is a package-level var so tests can override it.
+var verifyCommitOnMain = _verifyCommitOnMain
+
+func _verifyCommitOnMain(workDir, rigName, polecatName string) (bool, error) {
 	// Find town root from workDir
 	townRoot, err := workspace.Find(workDir)
 	if err != nil || townRoot == "" {
@@ -891,6 +886,8 @@ const (
 	ZombieIdleDirtySandbox ZombieClassification = "idle-dirty-sandbox"
 	// ZombieSessionDeadActive: session dead but agent state indicates active work.
 	ZombieSessionDeadActive ZombieClassification = "session-dead-active"
+	// ZombieAgentSelfReportedStuck: agent self-reported stuck via heartbeat v2 (gt-3vr5).
+	ZombieAgentSelfReportedStuck ZombieClassification = "agent-self-reported-stuck"
 )
 
 // ImpliesActiveWork returns true if this classification indicates the polecat
@@ -900,7 +897,7 @@ const (
 func (c ZombieClassification) ImpliesActiveWork() bool {
 	switch c {
 	case ZombieStuckInDone, ZombieAgentDeadInSession, ZombieBeadClosedStillRunning,
-		ZombieDoneIntentDead, ZombieSessionDeadActive:
+		ZombieDoneIntentDead, ZombieSessionDeadActive, ZombieAgentSelfReportedStuck:
 		return true
 	default:
 		return false
@@ -965,6 +962,9 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 	}
 	initRegistryFromTownRoot(townRoot)
 
+	// Load witness thresholds from config (fallback to compiled-in defaults).
+	witCfg := config.LoadOperationalConfig(townRoot).GetWitnessConfig()
+
 	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
 	entries, err := os.ReadDir(polecatsDir)
 	if err != nil {
@@ -993,7 +993,15 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 
 		prefix := beads.GetPrefixForRig(townRoot, rigName)
 		agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
-		labels := getAgentBeadLabels(bd, workDir, agentBeadID)
+
+		// gt-2gra: Fetch agent bead data once per polecat instead of 3-5 times
+		// across helper functions. The snapshot is passed to sub-functions.
+		snap := fetchAgentBeadSnapshot(bd, workDir, agentBeadID)
+
+		var labels []string
+		if snap != nil {
+			labels = snap.Labels
+		}
 		doneIntent := extractDoneIntent(labels)
 
 		if sessionAlive {
@@ -1001,9 +1009,12 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 			// have no hook_bead, agent_state="idle", and their sandbox is preserved
 			// for reuse. Skip them entirely during patrol. Only report if the
 			// sandbox is dirty (uncommitted changes in idle state).
-			agentState, _ := getAgentBeadState(bd, workDir, agentBeadID)
+			agentState := ""
+			if snap != nil {
+				agentState = snap.AgentState
+			}
 			if beads.AgentState(agentState) == AgentStateIdle {
-				cleanupStatus := getCleanupStatus(bd, workDir, rigName, polecatName)
+				cleanupStatus := snap.cleanupStatus()
 				if cleanupStatus != "" && cleanupStatus != "clean" {
 					// ZFC (gt-5rne): Report data, don't escalate. The witness agent
 					// decides whether dirty idle state warrants escalation.
@@ -1021,13 +1032,13 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 				continue
 			}
 
-			if zombie, found := detectZombieLiveSession(bd, workDir, rigName, polecatName, agentBeadID, sessionName, t, doneIntent); found {
+			if zombie, found := detectZombieLiveSession(bd, workDir, townRoot, rigName, polecatName, agentBeadID, sessionName, t, doneIntent, witCfg, snap); found {
 				result.Zombies = append(result.Zombies, zombie)
 			}
 			continue // Either handled or not a zombie
 		}
 
-		if zombie, found := detectZombieDeadSession(bd, workDir, rigName, polecatName, agentBeadID, sessionName, t, doneIntent, detectedAt); found {
+		if zombie, found := detectZombieDeadSession(bd, workDir, townRoot, rigName, polecatName, agentBeadID, sessionName, t, doneIntent, detectedAt, witCfg, snap); found {
 			result.Zombies = append(result.Zombies, zombie)
 		}
 	}
@@ -1040,17 +1051,56 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 //
 // gt-dsgp: Uses restart-first policy. Instead of nuking polecats, restarts their
 // sessions to preserve worktrees and branches.
-func detectZombieLiveSession(bd *BdCli, workDir, rigName, polecatName, agentBeadID, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent) (ZombieResult, bool) {
-	// Check for done-intent stuck too long (polecat hung in gt done).
+func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName, agentBeadID, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot) (ZombieResult, bool) {
+	// gt-2gra: Agent state and hook bead are read from the pre-fetched snapshot
+	// instead of calling getAgentBeadState multiple times per code path.
+	snapState, snapHook := "", ""
+	if snap != nil {
+		snapState, snapHook = snap.AgentState, snap.HookBead
+	}
+
+	// Heartbeat v2 check (gt-3vr5): if the agent reports its own state via heartbeat,
+	// trust the agent-reported state instead of inferring from timers.
+	// The witness makes exactly ONE inference: is the heartbeat fresh?
+	if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.IsV2() {
+		stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+		if !stale {
+			switch hb.EffectiveState() {
+			case polecat.HeartbeatExiting:
+				// Agent self-reports exiting — trust it, no timer-based inference.
+				// Replaces done-intent stuck timeout for v2 agents.
+				return ZombieResult{}, false
+
+			case polecat.HeartbeatStuck:
+				// Agent self-reports stuck — escalate (don't restart, agent is alive).
+				zombie := ZombieResult{
+					PolecatName:    polecatName,
+					AgentState:     snapState,
+					Classification: ZombieAgentSelfReportedStuck,
+					HookBead:       snapHook,
+					WasActive:      true,
+					Action:         fmt.Sprintf("escalated (agent self-reported stuck: %s)", hb.Context),
+				}
+				return zombie, true
+
+			case polecat.HeartbeatWorking, polecat.HeartbeatIdle:
+				// Fresh heartbeat, healthy state — not a zombie.
+				return ZombieResult{}, false
+			}
+		}
+		// Stale v2 heartbeat — fall through to legacy detection.
+		// Agent may have died; let the existing checks determine action.
+	}
+
+	// Legacy detection: Check for done-intent stuck too long (polecat hung in gt done).
 	// gt-dsgp: Restart instead of nuke — the session is stuck trying to exit,
 	// a fresh start will let it retry or pick up its hook cleanly.
-	if doneIntent != nil && time.Since(doneIntent.Timestamp) > DoneIntentGracePeriod {
-		stuckAgentState, stuckHookBead := getAgentBeadState(bd, workDir, agentBeadID)
+	if doneIntent != nil && time.Since(doneIntent.Timestamp) > witCfg.DoneIntentStuckTimeoutD() {
 		zombie := ZombieResult{
 			PolecatName:    polecatName,
-			AgentState:     stuckAgentState,
+			AgentState:     snapState,
 			Classification: ZombieStuckInDone,
-			HookBead:       stuckHookBead,
+			HookBead:       snapHook,
 			WasActive:      true,
 			Action:         fmt.Sprintf("restarted-stuck-session (done-intent age=%v)", time.Since(doneIntent.Timestamp).Round(time.Second)),
 		}
@@ -1069,12 +1119,11 @@ func detectZombieLiveSession(bd *BdCli, workDir, rigName, polecatName, agentBead
 	// Tmux alive but agent process dead (gt-kj6r6).
 	// gt-dsgp: Restart instead of nuke — preserve worktree and branch.
 	if !t.IsAgentAlive(sessionName) {
-		deadAgentState, deadAgentHookBead := getAgentBeadState(bd, workDir, agentBeadID)
 		zombie := ZombieResult{
 			PolecatName:    polecatName,
-			AgentState:     deadAgentState,
+			AgentState:     snapState,
 			Classification: ZombieAgentDeadInSession,
-			HookBead:       deadAgentHookBead,
+			HookBead:       snapHook,
 			WasActive:      true,
 			Action:         "restarted-agent-dead-session",
 		}
@@ -1093,13 +1142,12 @@ func detectZombieLiveSession(bd *BdCli, workDir, rigName, polecatName, agentBead
 	// Agent alive but hooked bead closed — occupying slot without work (gt-h1l6i).
 	// gt-dsgp: Restart instead of nuke — the fresh session will pick up its hook
 	// and run gt done properly, or go idle waiting for new work.
-	closedCheckState, hookBead := getAgentBeadState(bd, workDir, agentBeadID)
-	if hookBead != "" && getBeadStatus(bd, workDir, hookBead) == "closed" {
+	if snapHook != "" && getBeadStatus(bd, workDir, snapHook) == "closed" {
 		zombie := ZombieResult{
 			PolecatName:    polecatName,
-			AgentState:     closedCheckState,
+			AgentState:     snapState,
 			Classification: ZombieBeadClosedStillRunning,
-			HookBead:       hookBead,
+			HookBead:       snapHook,
 			WasActive:      true,
 			Action:         "restarted-bead-closed-polecat",
 		}
@@ -1123,18 +1171,37 @@ func detectZombieLiveSession(bd *BdCli, workDir, rigName, polecatName, agentBead
 //
 // gt-dsgp: Uses restart-first policy. Instead of nuking polecats with dead sessions,
 // restarts them to preserve worktrees and branches.
-func detectZombieDeadSession(bd *BdCli, workDir, rigName, polecatName, agentBeadID, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time) (ZombieResult, bool) {
+func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName, agentBeadID, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot) (ZombieResult, bool) {
+	// gt-2gra: Agent state and hook bead are read from the pre-fetched snapshot.
+	snapState, snapHook := "", ""
+	snapActiveMR := ""
+	if snap != nil {
+		snapState, snapHook = snap.AgentState, snap.HookBead
+		snapActiveMR = snap.ActiveMR
+	}
+
+	// Heartbeat v2 check (gt-3vr5): for dead sessions, a fresh heartbeat means
+	// the session isn't actually dead (race condition). A stale heartbeat confirms death.
+	// This check is supplementary — dead session detection proceeds normally after.
+	if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.IsV2() {
+		stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+		if !stale {
+			// Fresh heartbeat but session appears dead — possible race.
+			// Skip zombie detection; the session may have just restarted.
+			return ZombieResult{}, false
+		}
+	}
+
 	// Done-intent: polecat was trying to exit.
 	if doneIntent != nil {
 		age := time.Since(doneIntent.Timestamp)
-		if age < DoneIntentGracePeriod {
+		if age < witCfg.DoneIntentRecentGraceD() {
 			return ZombieResult{}, false // Recent — still working through gt done
 		}
-		diAgentState, diHookBead := getAgentBeadState(bd, workDir, agentBeadID)
 
 		// If bead is already closed, the polecat completed successfully.
 		// The dead session is expected (gt done kills it). Leave it alone. (gt-sy8)
-		beadAlreadyClosed := diHookBead != "" && getBeadStatus(bd, workDir, diHookBead) == "closed"
+		beadAlreadyClosed := snapHook != "" && getBeadStatus(bd, workDir, snapHook) == "closed"
 		if beadAlreadyClosed {
 			// gt-dsgp: Polecat completed its work. Don't nuke, don't restart.
 			// The sandbox is preserved for reuse by future slings.
@@ -1145,7 +1212,8 @@ func detectZombieDeadSession(bd *BdCli, workDir, rigName, polecatName, agentBead
 		// The polecat completed normally (gt done → session exit). Its MR is in the
 		// refinery queue. Nuking would delete the remote branch before the refinery
 		// can merge it. The dead session is expected, not a zombie.
-		if hasPendingMR(bd, workDir, rigName, polecatName, agentBeadID) {
+		// gt-2gra: Use snapshot's ActiveMR instead of calling getAgentActiveMR.
+		if hasPendingMRFromSnapshot(bd, workDir, polecatName, snapActiveMR) {
 			return ZombieResult{}, false
 		}
 
@@ -1153,9 +1221,9 @@ func detectZombieDeadSession(bd *BdCli, workDir, rigName, polecatName, agentBead
 		// restart it so it can retry the exit sequence or pick up new work.
 		zombie := ZombieResult{
 			PolecatName:    polecatName,
-			AgentState:     diAgentState,
+			AgentState:     snapState,
 			Classification: ZombieDoneIntentDead,
-			HookBead:       diHookBead,
+			HookBead:       snapHook,
 			WasActive:      true,
 			Action:         fmt.Sprintf("restarted (done-intent age=%v, type=%s)", age.Round(time.Second), doneIntent.ExitType),
 		}
@@ -1167,17 +1235,28 @@ func detectZombieDeadSession(bd *BdCli, workDir, rigName, polecatName, agentBead
 	}
 
 	// Standard zombie detection: active state or hooked bead with dead session.
-	agentState, hookBead := getAgentBeadState(bd, workDir, agentBeadID)
-	typedState := beads.AgentState(agentState)
-	if !isZombieState(typedState, hookBead) {
+	typedState := beads.AgentState(snapState)
+	if !isZombieState(typedState, snapHook) {
 		return ZombieResult{}, false
+	}
+
+	// GH#2036: Spawning polecats have hook_bead assigned but no tmux session yet.
+	// This is expected during worktree creation and session startup. Skip zombie
+	// detection if the polecat has been spawning for less than SpawnGracePeriod.
+	if typedState == beads.AgentStateSpawning {
+		// gt-2gra: Use snapshot's age instead of calling getAgentBeadAge.
+		spawnAge := snap.age()
+		if spawnAge < SpawnGracePeriod {
+			return ZombieResult{}, false
+		}
+		// Spawning for too long — fall through to zombie handling
 	}
 
 	// A polecat whose hook bead is already CLOSED completed its work
 	// successfully. The dead session is expected (gt done kills it).
 	// Don't flag as zombie or trigger re-dispatch. (gt-sy8)
 	// gt-dsgp: Don't nuke — sandbox preserved for reuse.
-	if hookBead != "" && getBeadStatus(bd, workDir, hookBead) == "closed" {
+	if snapHook != "" && getBeadStatus(bd, workDir, snapHook) == "closed" {
 		return ZombieResult{}, false
 	}
 
@@ -1188,15 +1267,16 @@ func detectZombieDeadSession(bd *BdCli, workDir, rigName, polecatName, agentBead
 
 	zombie := ZombieResult{
 		PolecatName:    polecatName,
-		AgentState:     agentState,
+		AgentState:     snapState,
 		Classification: ZombieSessionDeadActive,
-		HookBead:       hookBead,
-		WasActive:      hookBead != "" || typedState.IsActive(),
+		HookBead:       snapHook,
+		WasActive:      snapHook != "" || typedState.IsActive(),
 	}
 
 	// gt-dsgp: Restart instead of nuking. For dirty state, escalate AND restart.
-	cleanupStatus := getCleanupStatus(bd, workDir, rigName, polecatName)
-	handleZombieRestart(bd, workDir, rigName, polecatName, hookBead, cleanupStatus, &zombie)
+	// gt-2gra: Use snapshot's cleanup status instead of calling getCleanupStatus.
+	cleanupStatus := snap.cleanupStatus()
+	handleZombieRestart(bd, workDir, rigName, polecatName, snapHook, cleanupStatus, &zombie)
 	return zombie, true
 }
 
@@ -1292,21 +1372,13 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	}
 }
 
-// DoneIntentGracePeriod is how long to wait after a done-intent is set before
-// treating the polecat as a zombie. Used for both live sessions (stuck in gt done)
-// and dead sessions (died during gt done). A single constant prevents threshold
-// drift between the two detection paths (gt-y230).
-const DoneIntentGracePeriod = 60 * time.Second
-
-// StartupStallThreshold is the minimum session age before a session with no
-// recent tmux activity is considered stalled at startup. Sessions younger than
-// this are still in normal startup and should not be flagged.
-const StartupStallThreshold = 90 * time.Second
-
-// StartupActivityGrace is the maximum time since last tmux activity before
-// a session old enough to be past startup is considered stalled. If the session
-// has had tmux activity within this window, it's making progress.
-const StartupActivityGrace = 60 * time.Second
+// SpawnGracePeriod is how long to wait before treating a spawning polecat as a
+// potential zombie. Polecats in agent_state=spawning have hook_bead assigned but
+// no tmux session yet — this is expected during worktree creation and session
+// startup. On large repos (80k+ commits, 4.8GB+) sling can take several minutes.
+// Without this guard, the witness classifies spawning polecats as zombies and
+// nukes them before they finish starting up. See GH#2036.
+const SpawnGracePeriod = 5 * time.Minute
 
 // StalledResult represents a single stalled polecat detection.
 type StalledResult struct {
@@ -1347,6 +1419,11 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 	}
 	initRegistryFromTownRoot(townRoot)
 
+	// Load witness thresholds from config (fallback to compiled-in defaults).
+	witCfg := config.LoadOperationalConfig(townRoot).GetWitnessConfig()
+	stallThreshold := witCfg.StartupStallThresholdD()
+	activityGrace := witCfg.StartupActivityGraceD()
+
 	// List all polecat directories
 	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
 	entries, err := os.ReadDir(polecatsDir)
@@ -1380,7 +1457,16 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 			continue // Dead agent — zombie detection handles this
 		}
 
-		// Use structured signals to detect startup stalls:
+		// Heartbeat v2 check (gt-3vr5): if the agent has a fresh heartbeat,
+		// it's alive and making progress — skip stall detection entirely.
+		// This replaces tmux activity scraping for v2 agents.
+		if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.IsV2() {
+			if time.Since(hb.Timestamp) < polecat.SessionHeartbeatStaleThreshold {
+				continue // Fresh v2 heartbeat — agent is alive, not stalled
+			}
+		}
+
+		// Legacy: Use structured signals to detect startup stalls:
 		// session_created (age) + session_activity (last output).
 		createdUnix, err := t.GetSessionCreatedUnix(sessionName)
 		if err != nil {
@@ -1389,7 +1475,7 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 			continue
 		}
 		sessionAge := now.Sub(time.Unix(createdUnix, 0))
-		if sessionAge < StartupStallThreshold {
+		if sessionAge < stallThreshold {
 			continue // Too young — still in normal startup
 		}
 
@@ -1400,7 +1486,7 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 			continue
 		}
 		activityAge := now.Sub(activity)
-		if activityAge < StartupActivityGrace {
+		if activityAge < activityGrace {
 			continue // Recent activity — agent is making progress
 		}
 
@@ -1579,6 +1665,73 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 	discovery.Action = fmt.Sprintf("acknowledged-idle (exit=%s)", payload.Exit)
 }
 
+// agentBeadSnapshot holds all fields from a single bd show --json call for an agent bead.
+// Used to avoid redundant subprocess invocations during zombie detection, where the same
+// agent bead was previously queried 3-5 times per polecat per patrol cycle. (gt-2gra)
+type agentBeadSnapshot struct {
+	AgentState  string
+	HookBead    string
+	Labels      []string
+	UpdatedAt   string
+	ActiveMR    string
+	Fields      *beads.AgentFields // parsed from description
+}
+
+// fetchAgentBeadSnapshot fetches all agent bead data in a single bd show call.
+// Returns nil if the bead doesn't exist or can't be queried.
+func fetchAgentBeadSnapshot(bd *BdCli, workDir, agentBeadID string) *agentBeadSnapshot {
+	output, err := bd.Exec(workDir, "show", agentBeadID, "--json")
+	if err != nil || output == "" {
+		return nil
+	}
+
+	var issues []struct {
+		AgentState  string   `json:"agent_state"`
+		HookBead    string   `json:"hook_bead"`
+		Labels      []string `json:"labels"`
+		UpdatedAt   string   `json:"updated_at"`
+		ActiveMR    string   `json:"active_mr"`
+		Description string   `json:"description"`
+	}
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
+		return nil
+	}
+
+	return &agentBeadSnapshot{
+		AgentState: issues[0].AgentState,
+		HookBead:   issues[0].HookBead,
+		Labels:     issues[0].Labels,
+		UpdatedAt:  issues[0].UpdatedAt,
+		ActiveMR:   issues[0].ActiveMR,
+		Fields:     beads.ParseAgentFields(issues[0].Description),
+	}
+}
+
+// snapshotAge returns the time since the agent bead was last updated.
+// Returns a large duration if the timestamp can't be parsed, so callers
+// don't accidentally skip zombie detection on parse failure.
+func (s *agentBeadSnapshot) age() time.Duration {
+	if s == nil || s.UpdatedAt == "" {
+		return 24 * time.Hour
+	}
+	updatedAt, err := time.Parse(time.RFC3339, s.UpdatedAt)
+	if err != nil {
+		updatedAt, err = time.Parse("2006-01-02 15:04:05", s.UpdatedAt)
+		if err != nil {
+			return 24 * time.Hour
+		}
+	}
+	return time.Since(updatedAt)
+}
+
+// cleanupStatus returns the cleanup_status from the agent bead's description fields.
+func (s *agentBeadSnapshot) cleanupStatus() string {
+	if s == nil || s.Fields == nil {
+		return ""
+	}
+	return s.Fields.CleanupStatus
+}
+
 // getAgentBeadFields reads the full agent description fields from an agent bead,
 // including completion metadata (exit_type, mr_id, branch, mr_failed, completion_time).
 // Returns nil if the bead doesn't exist or can't be parsed.
@@ -1651,6 +1804,34 @@ func getAgentBeadState(bd *BdCli, workDir, agentBeadID string) (agentState, hook
 	return issues[0].AgentState, issues[0].HookBead
 }
 
+// getAgentBeadAge returns the time since the agent bead was last updated.
+// Used to determine how long a polecat has been in its current state (e.g.,
+// spawning). Returns a large duration if the bead can't be queried, so callers
+// don't accidentally skip zombie detection on query failure. See GH#2036.
+func getAgentBeadAge(bd *BdCli, workDir, agentBeadID string) time.Duration {
+	output, err := bd.Exec(workDir, "show", agentBeadID, "--json")
+	if err != nil || output == "" {
+		return 24 * time.Hour // Fail open: treat as old so zombie detection proceeds
+	}
+
+	var issues []struct {
+		UpdatedAt string `json:"updated_at"`
+	}
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
+		return 24 * time.Hour
+	}
+
+	updatedAt, err := time.Parse(time.RFC3339, issues[0].UpdatedAt)
+	if err != nil {
+		// Try common alternative formats
+		updatedAt, err = time.Parse("2006-01-02 15:04:05", issues[0].UpdatedAt)
+		if err != nil {
+			return 24 * time.Hour
+		}
+	}
+	return time.Since(updatedAt)
+}
+
 // getBeadStatus returns the status of a bead (e.g., "open", "closed", "hooked").
 // Returns empty string if the bead doesn't exist or can't be queried.
 func getBeadStatus(bd *BdCli, workDir, beadID string) string {
@@ -1672,11 +1853,13 @@ func getBeadStatus(bd *BdCli, workDir, beadID string) string {
 
 // resetAbandonedBead resets a dead polecat's hooked bead so it can be re-dispatched.
 // If the bead is in "hooked" or "in_progress" status, it:
+// 0. Checks if the polecat's work is already on main — if so, closes
+//    the bead instead of resetting (prevents re-dispatch of completed work)
 // 1. Records the respawn in the witness spawn-count ledger
 // 2. Resets status to open
 // 3. Clears assignee
 // 4. Sends mail to deacon for re-dispatch (includes respawn count; SPAWN_STORM
-//    prefix and Urgent priority when count exceeds DefaultMaxBeadRespawns)
+//    prefix and Urgent priority when count exceeds max bead respawns config)
 // Returns true if the bead was recovered.
 func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName string, router *mail.Router) bool {
 	if hookBead == "" {
@@ -1687,9 +1870,21 @@ func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName strin
 		return false
 	}
 
-	// Dedup guard (GH#2203): if another live polecat already has this bead,
-	// don't reset it — the bead is actively being worked on.
-	if IsBeadActivelyWorked(workDir, rigName, hookBead, polecatName) {
+	// Load max respawns threshold from config.
+	trRoot, trErr := workspace.Find(workDir)
+	if trErr != nil || trRoot == "" {
+		trRoot = workDir
+	}
+	maxRespawns := config.LoadOperationalConfig(trRoot).GetWitnessConfig().MaxBeadRespawnsV()
+
+	// Guard: if the polecat's commit is already on the default branch,
+	// the work is done — close the bead instead of resetting for re-dispatch.
+	// This prevents the spawn-storm / duplicate-work loop described in #2036.
+	if onMain, err := verifyCommitOnMain(workDir, rigName, polecatName); err == nil && onMain {
+		reason := fmt.Sprintf("Work already on main (verified by witness, polecat %s)", polecatName)
+		if err := bd.Run(workDir, "close", hookBead, "-r", reason); err != nil {
+			fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (work already on main): %v\n", hookBead, err)
+		}
 		return false
 	}
 
@@ -1712,7 +1907,7 @@ Previous Status: %s
 
 Action required: investigate why this task keeps killing its polecat,
 then either close the bead or reset the respawn counter.`,
-					hookBead, DefaultMaxBeadRespawns, rigName, polecatName, status),
+					hookBead, maxRespawns, rigName, polecatName, status),
 			}
 			if err := router.Send(msg); err != nil {
 				fmt.Fprintf(os.Stderr, "witness: failed to send SPAWN_BLOCKED mail for %s: %v, attempting nudge fallback\n", hookBead, err)
@@ -1741,7 +1936,7 @@ then either close the bead or reset the respawn counter.`,
 		subject := fmt.Sprintf("RECOVERED_BEAD %s", hookBead)
 		priority := mail.PriorityHigh
 		stormNote := ""
-		if respawnCount >= DefaultMaxBeadRespawns {
+		if respawnCount >= maxRespawns {
 			subject = fmt.Sprintf("SPAWN_STORM RECOVERED_BEAD %s (respawned %dx)", hookBead, respawnCount)
 			priority = mail.PriorityUrgent
 			stormNote = fmt.Sprintf("\n\n⚠️ SPAWN STORM: bead has been reset %d times. "+
@@ -1778,64 +1973,6 @@ Please re-dispatch to an available polecat.`,
 	}
 
 	return true
-}
-
-// IsBeadActivelyWorked checks whether a given bead is currently hooked to a live
-// polecat in the specified rig. This prevents duplicate work: if bead X is already
-// hooked to a live polecat, we must not reset it for re-dispatch or spawn a new
-// polecat for the same bead.
-//
-// excludePolecat is the name of the polecat being considered dead/abandoned — we
-// skip it since we already know it's dead. Pass "" to check all polecats.
-//
-// See: https://github.com/steveyegge/gastown/issues/2203
-func IsBeadActivelyWorked(workDir, rigName, beadID, excludePolecat string) bool {
-	if beadID == "" {
-		return false
-	}
-
-	townRoot, err := workspace.Find(workDir)
-	if err != nil || townRoot == "" {
-		townRoot = workDir
-	}
-	initRegistryFromTownRoot(townRoot)
-
-	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
-	entries, err := os.ReadDir(polecatsDir)
-	if err != nil {
-		return false
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
-			continue
-		}
-
-		polecatName := entry.Name()
-		if polecatName == excludePolecat {
-			continue
-		}
-
-		// Check if this polecat has our bead hooked
-		prefix := beads.GetPrefixForRig(townRoot, rigName)
-		agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
-		_, hookBead := getAgentBeadState(defaultBdProvider(), workDir, agentBeadID)
-		if hookBead != beadID {
-			continue
-		}
-
-		// This polecat has our bead — check if its session is alive
-		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
-		alive, err := hasSession(sessionName)
-		if err != nil {
-			continue // Transient error — don't block on it
-		}
-		if alive {
-			return true // Live polecat already working this bead
-		}
-	}
-
-	return false
 }
 
 // OrphanedBeadResult contains a single detected orphaned bead.
@@ -2354,6 +2491,19 @@ func hasPendingMR(bd *BdCli, workDir, _, polecatName, agentBeadID string) bool {
 
 	// Check 2: active_mr on agent bead (set by gt done when MR is created)
 	activeMR := getAgentActiveMR(bd, workDir, agentBeadID)
+	return activeMR != ""
+}
+
+// hasPendingMRFromSnapshot checks for a pending MR using a pre-fetched ActiveMR
+// value from the agent bead snapshot, avoiding a redundant bd show call. (gt-2gra)
+func hasPendingMRFromSnapshot(bd *BdCli, workDir, polecatName, activeMR string) bool {
+	// Check 1: Cleanup wisp with merge-requested state (created by HandlePolecatDone)
+	wispID, _ := findCleanupWisp(bd, workDir, polecatName)
+	if wispID != "" {
+		return true
+	}
+
+	// Check 2: active_mr from pre-fetched snapshot
 	return activeMR != ""
 }
 

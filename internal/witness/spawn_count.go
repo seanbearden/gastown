@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -16,11 +17,6 @@ import (
 // Cross-process serialization is handled by lock.FlockAcquire on a
 // sibling .flock file (see RecordBeadRespawn, ShouldBlockRespawn, etc.).
 var respawnMu sync.Mutex
-
-// DefaultMaxBeadRespawns is the threshold at which respawns are BLOCKED and
-// the bead is escalated to mayor instead of re-dispatched. This is the
-// circuit breaker that prevents spawn storms (clown show #22).
-const DefaultMaxBeadRespawns = 3
 
 // beadRespawnRecord tracks how many times a single bead has been reset for re-dispatch.
 type beadRespawnRecord struct {
@@ -68,9 +64,10 @@ func saveBeadRespawnState(townRoot string, state *beadRespawnState) error {
 }
 
 // ShouldBlockRespawn returns true if the bead has already been respawned
-// DefaultMaxBeadRespawns times. When true, the caller should escalate to
-// mayor instead of sending RECOVERED_BEAD to deacon for re-dispatch.
-// This is the primary circuit breaker for spawn storms (clown show #22).
+// MaxBeadRespawns times (from operational config). When true, the caller
+// should escalate to mayor instead of sending RECOVERED_BEAD to deacon
+// for re-dispatch. This is the primary circuit breaker for spawn storms
+// (clown show #22).
 func ShouldBlockRespawn(workDir, beadID string) bool {
 	respawnMu.Lock()
 	defer respawnMu.Unlock()
@@ -79,6 +76,7 @@ func ShouldBlockRespawn(workDir, beadID string) bool {
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
+	maxRespawns := config.LoadOperationalConfig(townRoot).GetWitnessConfig().MaxBeadRespawnsV()
 
 	// Cross-process flock to serialize with other witness instances.
 	unlock, flockErr := lock.FlockAcquire(beadRespawnStateFile(townRoot) + ".flock")
@@ -91,7 +89,7 @@ func ShouldBlockRespawn(workDir, beadID string) bool {
 	if !ok {
 		return false
 	}
-	return rec.Count >= DefaultMaxBeadRespawns
+	return rec.Count >= maxRespawns
 }
 
 // RecordBeadRespawn increments the respawn count for beadID and returns the new count.
