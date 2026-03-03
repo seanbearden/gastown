@@ -449,3 +449,5 @@
 {"actor":"gastown/refinery","comment":null,"created_at":"2026-03-02T07:39:04Z","event_type":"closed","id":1481,"issue_id":"gt-wisp-ggk2","new_value":"stale patrol cleanup","old_value":""}
 {"actor":"gastown/refinery","comment":null,"created_at":"2026-03-02T07:39:04Z","event_type":"closed","id":1482,"issue_id":"gt-wisp-b8p8","new_value":"stale patrol cleanup","old_value":""}
 {"actor":"gastown/refinery","comment":null,"created_at":"2026-03-02T07:39:05Z","event_type":"closed","id":1483,"issue_id":"gt-wisp-iamp","new_value":"stale patrol cleanup","old_value":""}
+{"actor":"quickbooks/crew/michael","comment":null,"created_at":"2026-03-03T10:32:07Z","event_type":"created","id":1484,"issue_id":"gt-gmae","new_value":"","old_value":""}
+{"actor":"quickbooks/crew/michael","comment":"Added label: desire-path","created_at":"2026-03-03T10:32:07Z","event_type":"label_added","id":1485,"issue_id":"gt-gmae","new_value":null,"old_value":null}
