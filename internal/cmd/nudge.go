@@ -193,11 +193,13 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			fmt.Fprintf(os.Stderr, "Warning: queue fallback failed (%v), delivering immediately\n", qErr)
 			return t.NudgeSession(sessionName, prefixedMessage)
 		}
-		// Launch background watcher: polls for idle over a longer window.
+		// Run watcher synchronously: polls for idle over a longer window.
 		// The UserPromptSubmit hook drains the queue on agent input, but an
 		// idle agent receives no input — so queued nudges are lost without
 		// this watcher. It exits on: delivery, session death, or timeout.
-		go watchAndDeliver(t, townRoot, sessionName)
+		// Must be synchronous (not a goroutine) because gt nudge is a CLI
+		// command — the process exits after return, killing any goroutines.
+		watchAndDeliver(t, townRoot, sessionName)
 		return nil
 
 	default: // NudgeModeImmediate
@@ -211,8 +213,9 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 // UserPromptSubmit hook entirely — that hook does not fire for tmux
 // send-keys input, so we cannot rely on it.
 //
-// This runs as a goroutine — the caller (gt nudge) may have already exited,
-// so errors are logged to stderr rather than returned.
+// This runs synchronously — gt nudge blocks until the watcher exits.
+// Errors are logged to stderr rather than returned since delivery failure
+// after successful queue write is non-fatal (queue persists for next drain).
 //
 // Exit conditions:
 //   - Agent becomes idle: drain queue and deliver formatted content, exit.
