@@ -135,13 +135,6 @@ var idleWatcherTimeout = 60 * time.Second
 // Var so tests can override.
 var idleWatcherPollInterval = 1 * time.Second
 
-// nudgeTriggerMessage is sent via tmux send-keys to trigger the
-// UserPromptSubmit hook when delivering queued nudges to idle agents.
-// The actual nudge content is delivered by the hook as a <system-reminder>,
-// not as user input. This keeps agents from interpreting nudges as
-// user interruptions or corrections.
-const nudgeTriggerMessage = "[nudge: see system-reminder below]"
-
 // deliverNudge routes a nudge based on the --mode flag.
 // For "immediate" mode: sends directly via tmux (current behavior).
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
@@ -174,20 +167,15 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// Try to wait for idle
 		err := t.WaitForIdle(sessionName, waitIdleTimeout)
 		if err == nil {
-			// Agent is idle — enqueue then trigger the UserPromptSubmit hook.
-			// The hook (gt mail check --inject) drains the queue and formats
-			// the nudge as a <system-reminder>, so the agent processes it as
-			// a background notification rather than a user interruption.
-			if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+			// Agent is idle — deliver directly. Format as system-reminder
+			// so the agent processes it as a background notification rather
+			// than a user interruption/correction.
+			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{{
 				Sender:   sender,
 				Message:  message,
 				Priority: nudgePriorityFlag,
-			}); qErr != nil {
-				// Queue failed — fall back to immediate delivery.
-				fmt.Fprintf(os.Stderr, "Warning: queue failed (%v), delivering immediately\n", qErr)
-				return t.NudgeSession(sessionName, prefixedMessage)
-			}
-			return t.NudgeSession(sessionName, nudgeTriggerMessage)
+			}})
+			return t.NudgeSession(sessionName, formatted)
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.
@@ -218,25 +206,25 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 }
 
 // watchAndDeliver polls a session for idle state over idleWatcherTimeout.
-// When the agent becomes idle, it sends a trigger message to fire the
-// UserPromptSubmit hook, which drains the nudge queue and delivers as a
-// <system-reminder>. This avoids sending the full nudge text as user input
-// (which agents interpret as an interruption/correction).
+// When the agent becomes idle, it drains the nudge queue and sends the
+// formatted content directly via NudgeSession. This bypasses the
+// UserPromptSubmit hook entirely — that hook does not fire for tmux
+// send-keys input, so we cannot rely on it.
 //
 // This runs as a goroutine — the caller (gt nudge) may have already exited,
 // so errors are logged to stderr rather than returned.
 //
 // Exit conditions:
-//   - Agent becomes idle: trigger hook for queue drain, exit.
+//   - Agent becomes idle: drain queue and deliver formatted content, exit.
 //   - Queue is empty (someone else drained it): exit.
 //   - Session disappears: exit (nothing to deliver to).
-//   - Timeout: exit (UserPromptSubmit hook will eventually drain on next input).
+//   - Timeout: exit (queue stays for next input or watcher cycle).
 func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 	deadline := time.Now().Add(idleWatcherTimeout)
 	for time.Now().Before(deadline) {
 		time.Sleep(idleWatcherPollInterval)
 
-		// If queue is already empty, someone else drained it (e.g., hook).
+		// If queue is already empty, someone else drained it.
 		if nudge.QueueLen(townRoot, sessionName) == 0 {
 			return
 		}
@@ -247,16 +235,21 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 		}
 
 		if t.IsIdle(sessionName) {
-			// Agent is idle — trigger the UserPromptSubmit hook to drain
-			// the queue. The hook (gt mail check --inject) formats nudges
-			// as <system-reminder> for non-interrupting delivery.
-			if err := t.NudgeSession(sessionName, nudgeTriggerMessage); err != nil {
-				fmt.Fprintf(os.Stderr, "idle-watcher: trigger for %s failed: %v\n", sessionName, err)
+			// Drain atomically claims queued entries (rename-based).
+			// If another process raced and drained first, we get an
+			// empty slice and skip delivery to avoid duplicates.
+			drained, _ := nudge.Drain(townRoot, sessionName)
+			if len(drained) == 0 {
+				return
+			}
+			formatted := nudge.FormatForInjection(drained)
+			if err := t.NudgeSession(sessionName, formatted); err != nil {
+				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
 			}
 			return
 		}
 	}
-	// Timeout — nudge stays in queue for UserPromptSubmit hook to drain.
+	// Timeout — nudge stays in queue for next watcher or manual drain.
 }
 
 // validNudgeModes is the set of allowed --mode values.
