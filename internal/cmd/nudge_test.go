@@ -434,7 +434,7 @@ func TestIdleWatcherExitsOnEmptyQueue(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		// Use a nil-safe Tmux — QueueLen returns 0 before IsIdle is called.
-		watchAndDeliver(nil, tmpDir, "test-session", "test message")
+		watchAndDeliver(nil, tmpDir, "test-session")
 		close(done)
 	}()
 
