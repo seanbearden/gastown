@@ -375,18 +375,6 @@ func TestIfFreshSessionAgeCheck(t *testing.T) {
 	}
 }
 
-func TestPostQueueSettleDelay(t *testing.T) {
-	// Verify the post-queue settle delay is reasonable (gt-y2zk).
-	// Too short: won't catch agents that just became idle.
-	// Too long: adds unnecessary latency to every queued nudge.
-	if postQueueSettleDelay < 100*time.Millisecond {
-		t.Errorf("postQueueSettleDelay = %v, too short to catch idle transitions", postQueueSettleDelay)
-	}
-	if postQueueSettleDelay > 1*time.Second {
-		t.Errorf("postQueueSettleDelay = %v, too long — adds latency to every queued nudge", postQueueSettleDelay)
-	}
-}
-
 func TestValidModeMapsMatchConstants(t *testing.T) {
 	// Ensure the validation maps cover all defined mode constants.
 	modes := []string{NudgeModeImmediate, NudgeModeQueue, NudgeModeWaitIdle}
@@ -400,5 +388,88 @@ func TestValidModeMapsMatchConstants(t *testing.T) {
 		if !validNudgePriorities[p] {
 			t.Errorf("priority constant %q missing from validNudgePriorities", p)
 		}
+	}
+}
+
+func TestIdleWatcherTimeout(t *testing.T) {
+	// Verify the watcher timeout is in a reasonable range.
+	if idleWatcherTimeout < 10*time.Second {
+		t.Errorf("idleWatcherTimeout = %v, too short (min 10s)", idleWatcherTimeout)
+	}
+	if idleWatcherTimeout > 5*time.Minute {
+		t.Errorf("idleWatcherTimeout = %v, too long (max 5m)", idleWatcherTimeout)
+	}
+}
+
+func TestIdleWatcherPollInterval(t *testing.T) {
+	// Verify the poll interval is reasonable — fast enough to be responsive,
+	// slow enough to not burn CPU.
+	if idleWatcherPollInterval < 200*time.Millisecond {
+		t.Errorf("idleWatcherPollInterval = %v, too fast (min 200ms)", idleWatcherPollInterval)
+	}
+	if idleWatcherPollInterval > 5*time.Second {
+		t.Errorf("idleWatcherPollInterval = %v, too slow (max 5s)", idleWatcherPollInterval)
+	}
+}
+
+func TestIdleWatcherExitsOnEmptyQueue(t *testing.T) {
+	// watchAndDeliver should exit immediately when queue is empty
+	// (someone else drained it). We test this by calling with a
+	// temp dir that has no queue files.
+	origTimeout := idleWatcherTimeout
+	origInterval := idleWatcherPollInterval
+	defer func() {
+		idleWatcherTimeout = origTimeout
+		idleWatcherPollInterval = origInterval
+	}()
+
+	// Very short timeout so test doesn't hang
+	idleWatcherTimeout = 500 * time.Millisecond
+	idleWatcherPollInterval = 50 * time.Millisecond
+
+	tmpDir := t.TempDir()
+
+	// watchAndDeliver checks QueueLen first — with no queue files,
+	// it should exit immediately. We verify it doesn't block.
+	done := make(chan struct{})
+	go func() {
+		// Use a nil-safe Tmux — QueueLen returns 0 before IsIdle is called.
+		watchAndDeliver(nil, tmpDir, "test-session", "test message")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Good — exited because queue was empty
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchAndDeliver did not exit within 2s for empty queue")
+	}
+}
+
+func TestQueueLen(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Empty queue
+	if got := nudge.QueueLen(tmpDir, "test-session"); got != 0 {
+		t.Errorf("QueueLen on empty dir = %d, want 0", got)
+	}
+
+	// Enqueue one
+	err := nudge.Enqueue(tmpDir, "test-session", nudge.QueuedNudge{
+		Sender:  "test",
+		Message: "hello",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	if got := nudge.QueueLen(tmpDir, "test-session"); got != 1 {
+		t.Errorf("QueueLen after enqueue = %d, want 1", got)
+	}
+
+	// Drain and verify empty
+	_, _ = nudge.Drain(tmpDir, "test-session")
+	if got := nudge.QueueLen(tmpDir, "test-session"); got != 0 {
+		t.Errorf("QueueLen after drain = %d, want 0", got)
 	}
 }

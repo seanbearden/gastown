@@ -123,11 +123,17 @@ const ifFreshMaxAge = 60 * time.Second
 // This is a var (not const) so tests can override it to avoid 15s waits.
 var waitIdleTimeout = 15 * time.Second
 
-// postQueueSettleDelay is how long to wait after enqueueing before checking
-// if the agent became idle. This catches the race where an agent finishes
-// processing (becomes idle) between WaitForIdle's timeout and the queue write.
+// idleWatcherTimeout is how long the background idle watcher polls after
+// queuing a nudge. If the agent becomes idle within this window, the watcher
+// drains the queue and delivers directly. This covers the gap where an agent
+// finishes work after WaitForIdle's timeout but before anyone sends new input
+// (so UserPromptSubmit never fires and the queue never drains).
 // Var so tests can override.
-var postQueueSettleDelay = 300 * time.Millisecond
+var idleWatcherTimeout = 60 * time.Second
+
+// idleWatcherPollInterval is how often the background watcher checks for idle.
+// Var so tests can override.
+var idleWatcherPollInterval = 1 * time.Second
 
 // deliverNudge routes a nudge based on the --mode flag.
 // For "immediate" mode: sends directly via tmux (current behavior).
@@ -180,23 +186,57 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			fmt.Fprintf(os.Stderr, "Warning: queue fallback failed (%v), delivering immediately\n", qErr)
 			return t.NudgeSession(sessionName, prefixedMessage)
 		}
-		// Post-queue idle recovery (gt-y2zk): the agent may have become idle
-		// between WaitForIdle's timeout and now (e.g., finished processing
-		// startup hooks while we were writing the queue entry). An idle agent
-		// will never drain its queue autonomously — the UserPromptSubmit hook
-		// only fires on input, so queued nudges for idle agents are lost.
-		// Brief settle, then check: if idle, drain queue and deliver directly.
-		time.Sleep(postQueueSettleDelay)
-		if t.IsIdle(sessionName) {
-			// Drain the queue to prevent double delivery, then deliver directly.
-			_, _ = nudge.Drain(townRoot, sessionName)
-			return t.NudgeSession(sessionName, prefixedMessage)
-		}
+		// Launch background watcher: polls for idle over a longer window.
+		// The UserPromptSubmit hook drains the queue on agent input, but an
+		// idle agent receives no input — so queued nudges are lost without
+		// this watcher. It exits on: delivery, session death, or timeout.
+		go watchAndDeliver(t, townRoot, sessionName, prefixedMessage)
 		return nil
 
 	default: // NudgeModeImmediate
 		return t.NudgeSession(sessionName, prefixedMessage)
 	}
+}
+
+// watchAndDeliver polls a session for idle state over idleWatcherTimeout.
+// When the agent becomes idle, it drains the nudge queue and delivers directly.
+// This runs as a goroutine — the caller (gt nudge) may have already exited,
+// so errors are logged to stderr rather than returned.
+//
+// Exit conditions:
+//   - Agent becomes idle: drain queue, deliver, exit.
+//   - Queue is empty (someone else drained it): exit.
+//   - Session disappears: exit (nothing to deliver to).
+//   - Timeout: exit (UserPromptSubmit hook will eventually drain on next input).
+func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName, prefixedMessage string) {
+	deadline := time.Now().Add(idleWatcherTimeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(idleWatcherPollInterval)
+
+		// If queue is already empty, someone else drained it (e.g., hook).
+		if nudge.QueueLen(townRoot, sessionName) == 0 {
+			return
+		}
+
+		// Check if session still exists — no point watching a dead session.
+		if exists, _ := t.HasSession(sessionName); !exists {
+			return
+		}
+
+		if t.IsIdle(sessionName) {
+			// Agent is idle — drain and deliver.
+			drained, _ := nudge.Drain(townRoot, sessionName)
+			if len(drained) == 0 {
+				// Someone else delivered between our check and drain.
+				return
+			}
+			if err := t.NudgeSession(sessionName, prefixedMessage); err != nil {
+				fmt.Fprintf(os.Stderr, "idle-watcher: delivery to %s failed: %v\n", sessionName, err)
+			}
+			return
+		}
+	}
+	// Timeout — nudge stays in queue for UserPromptSubmit hook to drain.
 }
 
 // validNudgeModes is the set of allowed --mode values.
