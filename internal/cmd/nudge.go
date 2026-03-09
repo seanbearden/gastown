@@ -191,7 +191,14 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			// Queue failed — fall back to immediate as last resort.
 			// Better to interrupt than lose the message entirely.
 			fmt.Fprintf(os.Stderr, "Warning: queue fallback failed (%v), delivering immediately\n", qErr)
-			return t.NudgeSession(sessionName, prefixedMessage)
+			// Still use FormatForInjection so the agent sees a consistent
+			// <system-reminder> format regardless of delivery path.
+			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{{
+				Sender:   sender,
+				Message:  message,
+				Priority: nudgePriorityFlag,
+			}})
+			return t.NudgeSession(sessionName, formatted)
 		}
 		// Run watcher synchronously: polls for idle over a longer window.
 		// The UserPromptSubmit hook drains the queue on agent input, but an
@@ -223,6 +230,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 //   - Session disappears: exit (nothing to deliver to).
 //   - Timeout: exit (queue stays for next input or watcher cycle).
 func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
+	fmt.Fprintf(os.Stderr, "Watching %s for idle (up to %s)...\n", sessionName, idleWatcherTimeout)
 	deadline := time.Now().Add(idleWatcherTimeout)
 	for time.Now().Before(deadline) {
 		time.Sleep(idleWatcherPollInterval)
@@ -237,7 +245,11 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 			return
 		}
 
-		if t.IsIdle(sessionName) {
+		// Use WaitForIdle with a short timeout instead of single-snapshot
+		// IsIdle to get the consecutive-poll guard (2 polls 200ms apart).
+		// This avoids false positives during inter-tool-call gaps where
+		// the prompt briefly appears while Claude Code is still working.
+		if err := t.WaitForIdle(sessionName, idleWatcherPollInterval); err == nil {
 			// Drain atomically claims queued entries (rename-based).
 			// If another process raced and drained first, we get an
 			// empty slice and skip delivery to avoid duplicates.
