@@ -88,7 +88,7 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			}
 
 			// Check if there are queued nudges.
-			if nudge.QueueLen(townRoot, sessionName) == 0 {
+			if n, _ := nudge.Pending(townRoot, sessionName); n == 0 {
 				continue
 			}
 
