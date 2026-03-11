@@ -427,6 +427,28 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
+
+	// If bd doesn't support --flat, retry without it. The retry is done here
+	// (not in callers like List) so that InjectFlatForListJSON doesn't re-add
+	// --flat on the retry path.
+	if err != nil && strings.Contains(stderr.String(), "unknown flag: --flat") {
+		retryArgs := make([]string, 0, len(fullArgs))
+		for _, a := range fullArgs {
+			if a != "--flat" {
+				retryArgs = append(retryArgs, a)
+			}
+		}
+		stdout.Reset()
+		stderr.Reset()
+		cmd = exec.Command("bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+		cmd.Dir = b.workDir
+		cmd.Env = runEnv
+		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err = cmd.Run()
+	}
+
 	if err != nil {
 		return nil, b.wrapError(err, stderr.String(), args)
 	}
@@ -672,15 +694,6 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	}
 
 	out, err := b.run(args...)
-	if err != nil && strings.Contains(err.Error(), "unknown flag: --flat") {
-		fallbackArgs := make([]string, 0, len(args)-1)
-		for _, arg := range args {
-			if arg != "--flat" {
-				fallbackArgs = append(fallbackArgs, arg)
-			}
-		}
-		out, err = b.run(fallbackArgs...)
-	}
 	if err != nil {
 		return nil, err
 	}
