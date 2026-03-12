@@ -201,10 +201,10 @@ func RunSpiderDetection(doltPath, forkDir string, cfg SpiderConfig) ([]FraudSign
 	// Run each detector independently. A failure in one detector shouldn't
 	// prevent others from running — partial results are better than none.
 	detectors := []struct {
-		name    string
-		kind    FraudSignalKind
-		query   string
-		scorer  func([]string) (float64, int, string)
+		name   string
+		kind   FraudSignalKind
+		query  string
+		scorer func([]string) (float64, int, string)
 	}{
 		{"collusion", SignalCollusion, collusionQuery(cfg), scoreCollusion},
 		{"rubber_stamp", SignalRubberStamp, rubberStampQuery(cfg), scoreRubberStamp},
