@@ -215,13 +215,13 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			return nil
 		}
 
-		// Claude Code TUI doesn't accept tmux send-keys reliably — text
-		// injected via NudgeSession goes into the void even when the agent
-		// is detected as idle. For agents with turn-boundary drain hooks
-		// (UserPromptSubmit), always use queue: the hook fires on the next
-		// turn boundary and drains reliably.
+		// For agents with turn-boundary drain (Claude Code), prefer queue
+		// delivery — the UserPromptSubmit hook drains reliably on the next
+		// turn boundary. But if the agent is idle (no turns coming), the
+		// queue would sit forever. So we queue first, then run watchAndDeliver
+		// which polls for idle and falls back to NudgeSession if needed.
 		if preset != nil && preset.HasTurnBoundaryDrain {
-			fmt.Fprintf(os.Stderr, "wait-idle: %s has turn-boundary drain, using queue mode\n", sessionName)
+			fmt.Fprintf(os.Stderr, "wait-idle: %s has turn-boundary drain, queuing with watcher\n", sessionName)
 			if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
 				Sender:   sender,
 				Message:  message,
@@ -235,6 +235,9 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				}})
 				return t.NudgeSession(sessionName, formatted)
 			}
+			// Watch for idle and deliver via NudgeSession if the hook doesn't
+			// drain the queue first (covers idle agents with no incoming turns).
+			watchAndDeliver(t, townRoot, sessionName)
 			return nil
 		}
 
