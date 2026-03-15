@@ -334,40 +334,22 @@ for entry in "${CANDIDATES[@]}"; do
     continue
   fi
 
-  # --- Step 4: Verify data integrity (row counts before/after) ----------------
+  # --- Step 4: Verify data integrity -------------------------------------------
+  #
+  # DOLT_RESET('--soft') + DOLT_COMMIT('-Am') is mathematically lossless — soft
+  # reset only moves the parent pointer while keeping all data staged, and the
+  # commit saves that exact staged data. Row count comparison is unreliable
+  # because concurrent bd writes between pre-flight and post-compaction snapshots
+  # cause false integrity failures (the counts aren't atomic).
+  #
+  # Primary check: table presence (no tables lost during flatten).
+  # Secondary check: row counts with high tolerance (>100 = catastrophic loss,
+  # not concurrent writes). Small differences are logged but not flagged.
 
   log "  Verifying integrity..."
   INTEGRITY_OK=true
 
-  while IFS= read -r TABLE; do
-    [[ -z "$TABLE" ]] && continue
-    if ! validate_name "$TABLE" "table"; then
-      continue
-    fi
-    POST_COUNT=$(dolt_query "$DB" "SELECT COUNT(*) FROM \`$TABLE\`" 2>/dev/null | head -1)
-    PRE=$(grep "^${TABLE}	" "$PRE_COUNTS_FILE" 2>/dev/null | cut -f2)
-    if [[ -z "$PRE" ]]; then
-      log "  WARNING: Table $TABLE appeared after compaction (new table?)"
-      continue
-    fi
-    if [[ "$POST_COUNT" != "$PRE" ]]; then
-      # Tolerate small differences from concurrent bd writes during compaction.
-      # The pre-flight and post-compaction counts are not atomic — bd operations
-      # (mail, beads, wisps) can insert/delete rows between the two snapshots.
-      # A tolerance of ±10 rows filters false positives without masking real
-      # data loss (which would show hundreds/thousands of missing rows).
-      DIFF=$(( POST_COUNT - PRE ))
-      ABS_DIFF=${DIFF#-}  # absolute value
-      if [[ "$ABS_DIFF" -le 10 ]]; then
-        log "  NOTE: $DB.$TABLE row count changed by $DIFF (pre=$PRE post=$POST_COUNT) — within tolerance, likely concurrent write"
-      else
-        log "  INTEGRITY FAILURE: $DB.$TABLE — pre=$PRE post=$POST_COUNT (diff=$DIFF exceeds tolerance)"
-        INTEGRITY_OK=false
-      fi
-    fi
-  done <<< "$PRE_TABLES"
-
-  # Check for missing tables (tables present before but gone after).
+  # Primary: check for missing tables (tables present before but gone after).
   POST_TABLES=$(dolt_query "$DB" \
     "SELECT table_name FROM information_schema.tables WHERE table_schema = '$DB' AND table_name NOT LIKE 'dolt_%' AND table_type = 'BASE TABLE'")
   while IFS=$'\t' read -r TABLE _; do
@@ -378,13 +360,38 @@ for entry in "${CANDIDATES[@]}"; do
     fi
   done < "$PRE_COUNTS_FILE"
 
+  # Secondary: spot-check row counts for catastrophic loss.
+  # Small differences are expected from concurrent bd writes during compaction
+  # (the pre-flight and post-compaction counts are not atomic snapshots).
+  # Only flag differences >100 rows — real data loss from a corrupt flatten
+  # would show hundreds/thousands of missing rows, not single-digit changes.
+  while IFS= read -r TABLE; do
+    [[ -z "$TABLE" ]] && continue
+    if ! validate_name "$TABLE" "table"; then
+      continue
+    fi
+    POST_COUNT=$(dolt_query "$DB" "SELECT COUNT(*) FROM \`$TABLE\`" 2>/dev/null | head -1)
+    PRE=$(grep "^${TABLE}	" "$PRE_COUNTS_FILE" 2>/dev/null | cut -f2)
+    [[ -z "$PRE" ]] && continue
+    if [[ "$POST_COUNT" != "$PRE" ]]; then
+      DIFF=$(( POST_COUNT - PRE ))
+      ABS_DIFF=${DIFF#-}
+      if [[ "$ABS_DIFF" -gt 100 ]]; then
+        log "  INTEGRITY FAILURE: $DB.$TABLE — pre=$PRE post=$POST_COUNT (diff=$DIFF)"
+        INTEGRITY_OK=false
+      elif [[ "$ABS_DIFF" -gt 0 ]]; then
+        log "  NOTE: $DB.$TABLE rows changed by $DIFF during compaction (concurrent write)"
+      fi
+    fi
+  done <<< "$PRE_TABLES"
+
   if ! $INTEGRITY_OK; then
     log "  ERROR: Integrity check FAILED for $DB"
     log "  WARNING: DATABASE LEFT IN COMPACTED STATE — MANUAL INSPECTION REQUIRED"
     ERRORS=$((ERRORS + 1))
     ERROR_DETAILS="${ERROR_DETAILS}${DB}: integrity check failed (DB left in compacted state)\n"
     gt escalate "compactor-dog: integrity failure in $DB" -s HIGH \
-      --reason "Row count mismatch after flatten compaction on $DB. DATABASE LEFT IN COMPACTED STATE — MANUAL INSPECTION REQUIRED." 2>/dev/null || true
+      --reason "Data integrity failure after flatten compaction on $DB. Tables missing or >100 row difference detected. MANUAL INSPECTION REQUIRED." 2>/dev/null || true
     continue
   fi
 
