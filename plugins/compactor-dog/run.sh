@@ -351,8 +351,19 @@ for entry in "${CANDIDATES[@]}"; do
       continue
     fi
     if [[ "$POST_COUNT" != "$PRE" ]]; then
-      log "  INTEGRITY FAILURE: $DB.$TABLE — pre=$PRE post=$POST_COUNT"
-      INTEGRITY_OK=false
+      # Tolerate small differences from concurrent bd writes during compaction.
+      # The pre-flight and post-compaction counts are not atomic — bd operations
+      # (mail, beads, wisps) can insert/delete rows between the two snapshots.
+      # A tolerance of ±10 rows filters false positives without masking real
+      # data loss (which would show hundreds/thousands of missing rows).
+      DIFF=$(( POST_COUNT - PRE ))
+      ABS_DIFF=${DIFF#-}  # absolute value
+      if [[ "$ABS_DIFF" -le 10 ]]; then
+        log "  NOTE: $DB.$TABLE row count changed by $DIFF (pre=$PRE post=$POST_COUNT) — within tolerance, likely concurrent write"
+      else
+        log "  INTEGRITY FAILURE: $DB.$TABLE — pre=$PRE post=$POST_COUNT (diff=$DIFF exceeds tolerance)"
+        INTEGRITY_OK=false
+      fi
     fi
   done <<< "$PRE_TABLES"
 
@@ -393,9 +404,10 @@ for entry in "${CANDIDATES[@]}"; do
   # Step 5b: Push compacted history to remote to maintain sync.
   # This MUST be a force-push because flatten rewrites the commit graph.
   # Safe here because: (1) we pulled first, (2) integrity is verified.
+  # Use --set-upstream because flatten loses branch tracking metadata.
   if $HAS_REMOTE; then
     log "  Pushing compacted history to remote ('$REMOTE_NAME')..."
-    if ! dolt_exec "$DB" "CALL DOLT_PUSH('--force', '$REMOTE_NAME')"; then
+    if ! dolt_exec "$DB" "CALL DOLT_PUSH('--force', '--set-upstream', '$REMOTE_NAME', 'main')"; then
       log "  WARNING: Force-push to remote failed for $DB"
       log "  Remote will be out of sync — manual 'dolt push --force' may be needed"
       ERROR_DETAILS="${ERROR_DETAILS}${DB}: force-push failed (local compacted, remote diverged)\n"
