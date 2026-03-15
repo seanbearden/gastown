@@ -325,9 +325,18 @@ for entry in "${CANDIDATES[@]}"; do
   fi
 
   # Step 3d: Commit all data as a single commit.
+  # "nothing to commit" is valid when soft-reset lands on identical data
+  # (e.g., only commit metadata changed, not table content). dolt_exec
+  # sends stderr to LOGFILE, so check LOGFILE for the "nothing to commit"
+  # message when the command fails.
   COMMIT_MSG="compaction: flatten history to single commit"
   log "  Committing flattened data..."
   if ! dolt_exec "$DB" "CALL DOLT_COMMIT('-Am', '$COMMIT_MSG')"; then
+    if grep -q "nothing to commit" "$LOGFILE" 2>/dev/null; then
+      log "  Nothing to commit (data unchanged) — compaction is a no-op, skipping"
+      SKIPPED+=("$DB (nothing to commit)")
+      continue
+    fi
     log "  ERROR: Flatten commit failed for $DB"
     ERRORS=$((ERRORS + 1))
     ERROR_DETAILS="${ERROR_DETAILS}${DB}: commit failed\n"
