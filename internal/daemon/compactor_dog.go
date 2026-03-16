@@ -300,7 +300,9 @@ func (d *Daemon) compactDatabase(dbName string) error {
 	}
 	d.logger.Printf("compactor_dog: %s: committed flattened data", dbName)
 
-	// Step 6: Verify integrity — row counts must match pre-flight.
+	// Step 6: Verify integrity — row counts must not decrease (data loss).
+	// Concurrent writes may increase counts during compaction — this is safe
+	// since the flattened commit includes those rows.
 	postCounts, err := d.compactorGetRowCounts(db, dbName)
 	if err != nil {
 		return fmt.Errorf("post-compact row counts: %w", err)
@@ -311,8 +313,12 @@ func (d *Daemon) compactDatabase(dbName string) error {
 		if !ok {
 			return fmt.Errorf("integrity check: table %q missing after compaction", table)
 		}
-		if preCount != postCount {
-			return fmt.Errorf("integrity check: table %q count mismatch: pre=%d post=%d", table, preCount, postCount)
+		if postCount < preCount {
+			return fmt.Errorf("integrity check: table %q lost rows: pre=%d post=%d", table, preCount, postCount)
+		}
+		if postCount > preCount {
+			d.logger.Printf("compactor_dog: %s: table %q gained %d rows during compaction (concurrent write, safe)",
+				dbName, table, postCount-preCount)
 		}
 	}
 	d.logger.Printf("compactor_dog: %s: integrity verified (%d tables match)", dbName, len(preCounts))
@@ -467,7 +473,8 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 	}
 	d.logger.Printf("compactor_dog: %s: rebase executed successfully", dbName)
 
-	// Step 6: Verify integrity.
+	// Step 6: Verify integrity — row counts must not decrease (data loss).
+	// Concurrent writes may increase counts during rebase — this is safe.
 	postCounts, err := d.compactorGetRowCounts(db, dbName)
 	if err != nil {
 		d.logger.Printf("compactor_dog: %s: WARNING: could not verify row counts after rebase: %v", dbName, err)
@@ -478,9 +485,13 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 				d.surgicalCleanup(db, baseBranch, workBranch)
 				return fmt.Errorf("integrity: table %q missing after rebase", table)
 			}
-			if preCount != postCount {
+			if postCount < preCount {
 				d.surgicalCleanup(db, baseBranch, workBranch)
-				return fmt.Errorf("integrity: table %q count mismatch: pre=%d post=%d", table, preCount, postCount)
+				return fmt.Errorf("integrity: table %q lost rows: pre=%d post=%d", table, preCount, postCount)
+			}
+			if postCount > preCount {
+				d.logger.Printf("compactor_dog: %s: table %q gained %d rows during rebase (concurrent write, safe)",
+					dbName, table, postCount-preCount)
 			}
 		}
 		d.logger.Printf("compactor_dog: %s: integrity verified (%d tables)", dbName, len(preCounts))
