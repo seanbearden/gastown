@@ -410,33 +410,20 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 }
 
 // UpdateAgentState updates the agent_state field in an agent bead.
-// When an in-process store is available and the bead is local, uses the store
-// directly (label-based, mirrors bd set-state behavior). Falls back to
-// bd set-state via runWithRouting for cross-rig agent beads.
+// bd >= 0.62.0 no longer provides a supported `bd agent state` writer, so
+// Gastown writes agent_state through the description field and readers mirror
+// that contract with fallback to the legacy structured column via ResolveAgentState.
+//
+// Resolves the concrete target DB first so the update hits the correct database
+// when the agent bead routes to a different beads dir via routes.jsonl.
 func (b *Beads) UpdateAgentState(id string, state string) (retErr error) {
 	defer func() { telemetry.RecordAgentStateChange(context.Background(), id, state, nil, retErr) }()
-	var err error
-	if b.store != nil {
-		// Use store path only when the bead is local (same beads directory).
-		// For cross-rig beads, fall through to runWithRouting.
-		targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
-		if targetDir == b.getResolvedBeadsDir() {
-			err = b.storeUpdateAgentState(id, state)
-		} else {
-			_, err = b.runWithRouting("set-state", id, "agent_state="+state)
-		}
-	} else {
-		// No store: use bd set-state (bd 0.62.0+) with routing support.
-		_, err = b.runWithRouting("set-state", id, "agent_state="+state)
+	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
+	target := b
+	if targetDir != b.getResolvedBeadsDir() {
+		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
 	}
-	if err != nil {
-		_ = err // Log but don't fail — description field update below is the fallback.
-	}
-
-	// Sync the description's agent_state field (gt-ulom).
-	// This is also the primary fallback when set-state fails on ephemeral
-	// agent beads (gt-4ao).
-	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{AgentState: &state})
+	return target.UpdateAgentDescriptionFields(id, AgentFieldUpdates{AgentState: &state})
 }
 
 // SetHookBead and ClearHookBead removed (hq-l6mm5).
@@ -631,12 +618,7 @@ func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
 	}
 
 	fields := ParseAgentFields(issue.Description)
-	// Prefer the structured agent_state column when present.
-	// Some writers (for example, `bd agent state`) update the DB column directly
-	// without rewriting the description text, so description-derived state can be stale.
-	if issue.AgentState != "" {
-		fields.AgentState = issue.AgentState
-	}
+	fields.AgentState = ResolveAgentState(issue.Description, issue.AgentState)
 	return issue, fields, nil
 }
 

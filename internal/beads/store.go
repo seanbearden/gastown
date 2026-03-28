@@ -525,32 +525,6 @@ func (b *Beads) storeGetLabels(id string) ([]string, error) {
 	return b.store.GetLabels(ctx, id)
 }
 
-// storeUpdateAgentState implements UpdateAgentState via label management.
-// bd set-state uses the convention dimension:value as labels. This mirrors that
-// behavior: removes any existing agent_state:* label and adds agent_state:<state>.
-func (b *Beads) storeUpdateAgentState(id, state string) error {
-	ctx, cancel := storeCtx()
-	defer cancel()
-
-	labels, err := b.store.GetLabels(ctx, id)
-	if err != nil {
-		return fmt.Errorf("getting labels for agent state update: %w", err)
-	}
-
-	actor := b.getActor()
-	prefix := "agent_state:"
-	newLabel := prefix + state
-
-	for _, label := range labels {
-		if strings.HasPrefix(label, prefix) && label != newLabel {
-			// Ignore remove errors: non-fatal, the add below is the important operation.
-			_ = b.store.RemoveLabel(ctx, id, label, actor)
-		}
-	}
-
-	return b.store.AddLabel(ctx, id, newLabel, actor)
-}
-
 // storeDelegationSet stores delegation data in the issue's metadata under the
 // "delegated_from" key. Merges with any existing metadata to avoid clobbering
 // other keys.
