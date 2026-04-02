@@ -775,41 +775,33 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 	// Step 2: Create step beads and wire dependencies
 	stepBeads := make(map[string]string) // step.ID -> bead ID
 
-	// Build variable context for template rendering
-	varCtx := make(map[string]interface{})
-	for k, v := range f.Vars {
-		if v.Default != "" {
-			varCtx[k] = v.Default
-		}
-	}
-
 	for _, step := range f.Steps {
 		stepBeadID := fmt.Sprintf("%s-wfs-%s", rigPrefix, generateFormulaShortID())
 
-		// Render step description with variable context
-		stepDesc := step.Description
-		if len(varCtx) > 0 {
-			if rendered, err := renderTemplate(stepDesc, varCtx); err == nil {
-				stepDesc = rendered
-			}
-		}
+		// Step descriptions contain {{var}} placeholders (e.g., {{problem}},
+		// {{context}}) that are instructions for the executing AGENT, not Go
+		// template vars. Do not render them — pass through verbatim.
 
+		// Use --body-file=- (stdin) for the description to avoid CLI arg
+		// length limits and quoting issues with large markdown descriptions.
 		stepArgs := []string{
 			"create",
 			"--type=task",
 			"--id=" + stepBeadID,
 			"--title=" + step.Title,
-			"--description=" + stepDesc,
+			"--body-file=-",
 		}
 		if beads.NeedsForceForID(stepBeadID) {
 			stepArgs = append(stepArgs, "--force")
 		}
 
-		if err := BdCmd(stepArgs...).
+		createCmd := BdCmd(stepArgs...).
 			WithAutoCommit().
 			Dir(rigBeadsDir).
 			Stderr(os.Stderr).
-			Run(); err != nil {
+			Build()
+		createCmd.Stdin = strings.NewReader(step.Description)
+		if err := createCmd.Run(); err != nil {
 			fmt.Printf("%s Failed to create step bead for %s: %v\n",
 				style.Dim.Render("Warning:"), step.ID, err)
 			continue
