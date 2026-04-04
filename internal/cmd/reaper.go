@@ -243,12 +243,11 @@ var reaperPurgeCmd = &cobra.Command{
 	Long: `Delete closed wisps past the purge-age threshold and closed mail
 past the mail-age threshold. Irreversible operation.
 
+When --db is provided, purges a single database. When omitted, auto-discovers
+all databases on the Dolt server and purges each one.
+
 Returns counts of purged rows. Use --dry-run to preview.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if reaperDB == "" {
-			return fmt.Errorf("--db is required")
-		}
-
 		purgeAge, err := time.ParseDuration(reaperPurgeAge)
 		if err != nil {
 			return fmt.Errorf("invalid --purge-age: %w", err)
@@ -258,34 +257,66 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 			return fmt.Errorf("invalid --mail-age: %w", err)
 		}
 
-		db, err := reaper.OpenDB(reaperHost, reaperPort, reaperDB, 30*time.Second, 30*time.Second)
-		if err != nil {
-			return fmt.Errorf("connect to %s: %w", reaperDB, err)
-		}
-		defer db.Close()
-
-		if ok, err := reaper.HasReaperSchema(db); err != nil {
-			return fmt.Errorf("check reaper schema on %s: %w", reaperDB, err)
-		} else if !ok {
-			return fmt.Errorf("database %s missing wisps/issues tables (beads schema not initialized on this server)", reaperDB)
+		databases := reaper.DiscoverDatabases(reaperHost, reaperPort)
+		if reaperDB != "" {
+			databases = strings.Split(reaperDB, ",")
 		}
 
-		result, err := reaper.Purge(db, reaperDB, purgeAge, mailAge, reaperDryRun)
-		if err != nil {
-			return fmt.Errorf("purge %s: %w", reaperDB, err)
+		var results []*reaper.PurgeResult
+		for _, dbName := range databases {
+			if err := reaper.ValidateDBName(dbName); err != nil {
+				fmt.Fprintf(os.Stderr, "skip invalid db: %s\n", dbName)
+				continue
+			}
+
+			db, err := reaper.OpenDB(reaperHost, reaperPort, dbName, 30*time.Second, 30*time.Second)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: connect error: %v\n", dbName, err)
+				continue
+			}
+
+			if ok, err := reaper.HasReaperSchema(db); err != nil {
+				fmt.Fprintf(os.Stderr, "%s: schema check error: %v\n", dbName, err)
+				db.Close()
+				continue
+			} else if !ok {
+				db.Close()
+				continue
+			}
+
+			result, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun)
+			db.Close()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: purge error: %v\n", dbName, err)
+				continue
+			}
+			results = append(results, result)
 		}
 
 		if reaperJSON {
-			fmt.Println(reaper.FormatJSON(result))
+			fmt.Println(reaper.FormatJSON(results))
 		} else {
-			prefix := ""
-			if result.DryRun {
-				prefix = "[DRY RUN] would "
+			var totalWisps, totalMail int
+			for _, r := range results {
+				prefix := ""
+				if r.DryRun {
+					prefix = "[DRY RUN] would "
+				}
+				fmt.Printf("%s: %spurged %d wisps, %d mail\n",
+					r.Database, prefix, r.WispsPurged, r.MailPurged)
+				for _, a := range r.Anomalies {
+					fmt.Printf("  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
+				}
+				totalWisps += r.WispsPurged
+				totalMail += r.MailPurged
 			}
-			fmt.Printf("%s: %spurged %d wisps, %d mail\n",
-				result.Database, prefix, result.WispsPurged, result.MailPurged)
-			for _, a := range result.Anomalies {
-				fmt.Printf("  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
+			if len(results) > 1 {
+				prefix := ""
+				if reaperDryRun {
+					prefix = "[DRY RUN] "
+				}
+				fmt.Printf("\n%sPurge summary (%d databases): purged %d wisps, %d mail\n",
+					prefix, len(results), totalWisps, totalMail)
 			}
 		}
 		return nil
